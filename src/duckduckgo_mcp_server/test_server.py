@@ -41,6 +41,13 @@ from duckduckgo_mcp_server.server import (
     _env_int,
     SUPPORTED_PARSE_MODES,
     _safe_markdown_href,
+    FetchRejectedError,
+    FetchedText,
+    _cap_text,
+    _content_type_allowed,
+    _declared_too_large,
+    DEFAULT_MAX_CONTENT_BYTES,
+    DEFAULT_CACHE_MAX_BYTES,
 )
 
 try:
@@ -767,6 +774,46 @@ def _serve_html(html_content):
     return url, stop
 
 
+def _serve_raw(body: bytes, content_type="text/html", declared_length=None, send_length=True):
+    """Serve a fixed body with controllable headers. Returns (url, stop_fn).
+
+    Unlike _serve_html this exposes Content-Type and Content-Length directly, and
+    can omit Content-Length entirely (HTTP/1.0, close-delimited) so the streaming
+    byte ceiling can be exercised rather than the header pre-check.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_GET(self):
+            self.send_response(200)
+            if content_type is not None:
+                self.send_header("Content-type", content_type)
+            if send_length:
+                length = declared_length if declared_length is not None else len(body)
+                self.send_header("Content-Length", str(length))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # Expected when the client abandons an oversized response.
+                pass
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def stop():
+        server.shutdown()
+        thread.join()
+
+    return url, stop
+
+
 # Backends to exercise in the parameterized fetcher tests. curl is only included
 # when curl_cffi is actually installed (the optional [browser] extra).
 _FETCH_BACKENDS_FOR_TESTING = ["httpx"] + (["curl"] if HAS_CURL_CFFI else [])
@@ -1052,18 +1099,63 @@ class TestParseModes(unittest.TestCase):
         self.assertEqual(duckduckgo_mcp_server.server.fetcher.default_parse_mode, "markdown")
 
 
+class _FakeStream:
+    """Stands in for ``client.stream(...)``: an async context manager yielding a response.
+
+    Both backends stream response bodies so an oversized page can be abandoned
+    mid-download, so test doubles have to present that shape rather than a plain
+    awaited ``.get()``.
+    """
+
+    def __init__(self, response=None, side_effect=None):
+        self._response = response
+        self._side_effect = side_effect
+
+    async def __aenter__(self):
+        if self._side_effect is not None:
+            raise self._side_effect
+        return self._response
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def _as_stream_response(resp):
+    """Teach a mock response the streaming read API used by both backends."""
+    body = resp.text if isinstance(getattr(resp, "text", None), str) else ""
+
+    async def _aiter(*args, **kwargs):
+        if body:
+            yield body.encode("utf-8")
+
+    resp.aiter_bytes = _aiter
+    resp.aiter_content = _aiter
+    resp.charset_encoding = "utf-8"
+    resp.encoding = "utf-8"
+    # Real headers, so content-type/length checks behave deterministically
+    # instead of relying on MagicMock attribute truthiness.
+    if not isinstance(getattr(resp, "headers", None), dict):
+        resp.headers = {}
+    return resp
+
+
 def _patch_backend_client(backend, *, get_return_value=None, get_side_effect=None):
     """Return a context manager that patches the HTTP client for the given backend.
 
     - "httpx": patches `httpx.AsyncClient`.
     - "curl":  patches `curl_cffi.requests.AsyncSession`.
-    Both are patched with an AsyncMock whose .get() uses the provided return/side-effect.
+    Both are patched with a client whose .stream() yields the provided response
+    (or raises the provided side effect).
     """
+    if get_return_value is not None:
+        get_return_value = _as_stream_response(get_return_value)
+
     mock_client = AsyncMock()
-    if get_side_effect is not None:
-        mock_client.get = AsyncMock(side_effect=get_side_effect)
-    else:
-        mock_client.get = AsyncMock(return_value=get_return_value)
+    mock_client.stream = MagicMock(
+        side_effect=lambda *a, **k: _FakeStream(
+            response=get_return_value, side_effect=get_side_effect
+        )
+    )
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -1072,6 +1164,153 @@ def _patch_backend_client(backend, *, get_return_value=None, get_side_effect=Non
     elif backend == "curl":
         return patch("curl_cffi.requests.AsyncSession", return_value=mock_client)
     raise ValueError(f"no patcher for backend {backend!r}")
+
+
+class TestContentSizeLimits(unittest.TestCase):
+    """Transport-level caps: max_length only paginates already-parsed text, so
+    without these a single huge page is fully downloaded and parsed first."""
+
+    def test_declared_oversize_is_refused_without_downloading(self):
+        # Declares 50 MB but sends a few bytes: if the guard actually read the
+        # body this would mismatch rather than return promptly.
+        url, stop = _serve_raw(b"<html><body>small</body></html>", declared_length=50_000_000)
+        try:
+            for backend in _FETCH_BACKENDS_FOR_TESTING:
+                with self.subTest(backend=backend):
+                    fetcher = WebContentFetcher(
+                        backend=backend, allow_private_urls=True, max_content_bytes=1000
+                    )
+                    result = asyncio.run(fetcher.fetch_and_parse(url, DummyCtx()))
+                    self.assertTrue(result.startswith("Error"), f"got: {result!r}")
+                    self.assertIn("50000000-byte body", result)
+        finally:
+            stop()
+
+    def test_streaming_cap_truncates_undeclared_body(self):
+        # No Content-Length, so only the streaming ceiling can stop this.
+        body = b"<html><body><p>" + b"A" * 20_000 + b"</p></body></html>"
+        url, stop = _serve_raw(body, send_length=False)
+        try:
+            for backend in _FETCH_BACKENDS_FOR_TESTING:
+                with self.subTest(backend=backend):
+                    fetcher = WebContentFetcher(
+                        backend=backend, allow_private_urls=True, max_content_bytes=2000
+                    )
+                    result = asyncio.run(
+                        fetcher.fetch_and_parse(url, DummyCtx(), max_length=50_000)
+                    )
+                    self.assertIn("download", result)
+                    self.assertIn("truncated before parsing", result)
+                    # Far below the 20k the server offered.
+                    self.assertLess(len(result), 6000)
+        finally:
+            stop()
+
+    def test_non_text_content_type_is_refused(self):
+        url, stop = _serve_raw(b"\x89PNG\r\n\x1a\n binary", content_type="image/png")
+        try:
+            for backend in _FETCH_BACKENDS_FOR_TESTING:
+                with self.subTest(backend=backend):
+                    fetcher = WebContentFetcher(backend=backend, allow_private_urls=True)
+                    result = asyncio.run(fetcher.fetch_and_parse(url, DummyCtx()))
+                    self.assertTrue(result.startswith("Error"), f"got: {result!r}")
+                    self.assertIn("image/png", result)
+        finally:
+            stop()
+
+    def test_normal_page_is_unaffected_by_the_caps(self):
+        url, stop = _serve_raw(b"<html><body><h1>Fine</h1></body></html>")
+        try:
+            fetcher = WebContentFetcher(allow_private_urls=True)
+            result = asyncio.run(fetcher.fetch_and_parse(url, DummyCtx()))
+            self.assertIn("Fine", result)
+            self.assertNotIn("truncated before parsing", result)
+        finally:
+            stop()
+
+    def test_zero_limit_disables_the_ceiling(self):
+        body = b"<html><body><p>" + b"B" * 5000 + b"</p></body></html>"
+        url, stop = _serve_raw(body, send_length=False)
+        try:
+            fetcher = WebContentFetcher(allow_private_urls=True, max_content_bytes=0)
+            result = asyncio.run(
+                fetcher.fetch_and_parse(url, DummyCtx(), max_length=50_000)
+            )
+            self.assertNotIn("truncated before parsing", result)
+            self.assertIn("B" * 4000, result)
+        finally:
+            stop()
+
+    def test_cache_byte_budget_evicts_lru(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=10, max_bytes=100)
+        cache.set("a", "x" * 60)
+        cache.set("b", "y" * 60)  # together they exceed 100 bytes
+        self.assertIsNone(cache.get("a"))
+        self.assertEqual(cache.get("b"), "y" * 60)
+        self.assertLessEqual(cache.total_bytes, 100)
+
+    def test_cache_skips_value_larger_than_whole_budget(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=10, max_bytes=100)
+        cache.set("big", "z" * 500)
+        self.assertIsNone(cache.get("big"))
+        self.assertEqual(len(cache), 0)
+
+    def test_cache_byte_budget_disabled_by_zero(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=10, max_bytes=0)
+        cache.set("a", "x" * 5000)
+        self.assertEqual(cache.get("a"), "x" * 5000)
+
+    def test_cache_tolerates_unsized_values(self):
+        # Non-str values count as 0 bytes and stay governed by the entry cap.
+        cache = TTLCache(ttl_seconds=60, max_entries=2, max_bytes=10)
+        cache.set("a", 1)
+        cache.set("b", 2)
+        self.assertEqual(cache.get("a"), 1)
+        self.assertEqual(cache.get("b"), 2)
+
+    def test_cap_text_helper(self):
+        self.assertEqual(_cap_text("abc", 10), "abc")
+        self.assertFalse(_cap_text("abc", 10).truncated)
+        capped = _cap_text("abcdef", 3)
+        self.assertEqual(capped, "abc")
+        self.assertTrue(capped.truncated)
+        self.assertFalse(_cap_text("abcdef", 0).truncated)  # 0 disables
+
+    def test_fetched_text_is_a_plain_str(self):
+        value = FetchedText("hello", truncated=True)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value.upper(), "HELLO")
+        self.assertTrue(value.truncated)
+        # Bare strings (as returned by patched test doubles) read as untruncated.
+        self.assertFalse(getattr("plain", "truncated", False))
+
+    def test_content_type_allowed(self):
+        for ok in ("text/html", "text/html; charset=utf-8", "text/plain", "application/xml", None, ""):
+            self.assertTrue(_content_type_allowed(ok), ok)
+        for bad in ("image/png", "application/zip", "video/mp4", "application/octet-stream"):
+            self.assertFalse(_content_type_allowed(bad), bad)
+
+    def test_declared_too_large_helper(self):
+        self.assertEqual(_declared_too_large({"content-length": "500"}, 100), 500)
+        self.assertIsNone(_declared_too_large({"content-length": "50"}, 100))
+        self.assertIsNone(_declared_too_large({"content-length": "junk"}, 100))
+        self.assertIsNone(_declared_too_large({}, 100))
+        self.assertIsNone(_declared_too_large({"content-length": "500"}, 0))  # 0 disables
+
+    def test_defaults_are_applied(self):
+        fetcher = WebContentFetcher()
+        self.assertEqual(fetcher.max_content_bytes, DEFAULT_MAX_CONTENT_BYTES)
+        self.assertEqual(fetcher.cache.max_bytes, DEFAULT_CACHE_MAX_BYTES)
+
+    def test_fetch_rejected_error_is_not_leaked_as_a_traceback(self):
+        fetcher = WebContentFetcher(allow_private_urls=True)
+        with patch.object(
+            fetcher, "_fetch_httpx", side_effect=FetchRejectedError("nope")
+        ):
+            result = asyncio.run(
+                fetcher.fetch_and_parse("https://example.com", DummyCtx())
+            )
+        self.assertEqual(result, "Error: nope.")
 
 
 class TestWebContentFetcherErrors(unittest.TestCase):
@@ -1351,7 +1590,9 @@ class TestSSRFGuard(unittest.TestCase):
         redirect_resp.headers = {"location": "http://127.0.0.1/secret"}
 
         mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=redirect_resp)
+        mock_client.stream = MagicMock(
+            side_effect=lambda *a, **k: _FakeStream(response=redirect_resp)
+        )
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -1619,8 +1860,11 @@ class TestSSLVerifyConfig(unittest.TestCase):
         mock_resp.status_code = 200
         mock_resp.headers = {}
         mock_resp.raise_for_status = MagicMock()
+        _as_stream_response(mock_resp)
         mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.stream = MagicMock(
+            side_effect=lambda *a, **k: _FakeStream(response=mock_resp)
+        )
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 

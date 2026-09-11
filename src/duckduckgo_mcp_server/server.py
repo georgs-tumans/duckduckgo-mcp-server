@@ -40,6 +40,17 @@ REF_SCHEME = "ref://"
 # search output. 0 disables shortening.
 DEFAULT_REF_URL_THRESHOLD = 120
 
+# Maximum bytes read from one response. This is a transport-level ceiling:
+# `max_length` only paginates text that has *already* been downloaded and parsed,
+# so without this cap a single huge page is fully buffered and parsed first (a
+# measured 80 MB page drove ~249 MB of peak heap). 0 disables the limit.
+# Defined up here because it is used as a default argument below.
+DEFAULT_MAX_CONTENT_BYTES = 5_000_000
+
+# Total size of the parsed text held in the fetch cache. The entry-count cap alone
+# lets a handful of very large pages dominate memory. 0 disables the byte budget.
+DEFAULT_CACHE_MAX_BYTES = 16_000_000
+
 
 class LinkRegistry:
     """In-memory map from short ``ref://<id>`` tokens to full URLs (issue #43).
@@ -247,18 +258,41 @@ async def _sleep_retry_after(headers, default: float = 2.0) -> float:
     return wait
 
 
+def _entry_size(value) -> int:
+    """Approximate in-memory size of a cached value, for the byte budget.
+
+    Values the cache can't size (ints, objects) count as 0 so they are governed
+    by the entry-count cap alone — the budget exists to bound large page text,
+    not to be a general-purpose accountant.
+    """
+    if isinstance(value, (str, bytes, bytearray)):
+        return len(value)
+    if isinstance(value, tuple):
+        return sum(_entry_size(item) for item in value)
+    return 0
+
+
 class TTLCache:
-    """In-memory TTL cache with LRU eviction.
+    """In-memory TTL cache with LRU eviction and a total-size budget.
 
     Used by ``fetch_content`` so paginated reads of the same URL
     (``start_index`` / ``max_length``) reuse one download and parse. A TTL of 0
-    or ``max_entries`` of 0 disables the cache. No external dependencies.
+    or ``max_entries`` of 0 disables the cache. ``max_bytes`` bounds the summed
+    size of cached values so a few very large pages cannot dominate memory even
+    while staying under the entry count; 0 disables that budget. No external
+    dependencies.
     """
 
-    def __init__(self, ttl_seconds: float = 300.0, max_entries: int = 64):
+    def __init__(
+        self,
+        ttl_seconds: float = 300.0,
+        max_entries: int = 64,
+        max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
+    ):
         self.ttl_seconds = max(0.0, float(ttl_seconds))
         self.max_entries = max(0, int(max_entries))
-        # key -> (expires_at_monotonic, value). Insertion order is LRU order.
+        self.max_bytes = max(0, int(max_bytes))
+        # key -> (expires_at_monotonic, value, size). Insertion order is LRU order.
         self._store: dict = {}
 
     @property
@@ -268,13 +302,17 @@ class TTLCache:
     def __len__(self) -> int:
         return len(self._store)
 
+    @property
+    def total_bytes(self) -> int:
+        return sum(entry[2] for entry in self._store.values())
+
     def get(self, key):
         if not self.enabled:
             return None
         entry = self._store.get(key)
         if entry is None:
             return None
-        expires_at, value = entry
+        expires_at, value, _size = entry
         if time.monotonic() >= expires_at:
             self._store.pop(key, None)
             return None
@@ -283,18 +321,26 @@ class TTLCache:
         self._store[key] = entry
         return value
 
-    def set(self, key, value) -> None:
+    def set(self, key, value, size: Optional[int] = None) -> None:
         if not self.enabled:
             return
+        if size is None:
+            size = _entry_size(value)
         now = time.monotonic()
-        expired = [k for k, (exp, _) in self._store.items() if now >= exp]
+        expired = [k for k, (exp, _v, _s) in self._store.items() if now >= exp]
         for k in expired:
             self._store.pop(k, None)
-        if key in self._store:
-            self._store.pop(key)
-        elif len(self._store) >= self.max_entries:
+        self._store.pop(key, None)
+        # A single value larger than the whole budget is never cached — storing it
+        # would evict everything else and still overflow.
+        if self.max_bytes and size > self.max_bytes:
+            return
+        while len(self._store) >= self.max_entries:
             self._store.pop(next(iter(self._store)))
-        self._store[key] = (now + self.ttl_seconds, value)
+        self._store[key] = (now + self.ttl_seconds, value, size)
+        # Evict least-recently-used entries until the byte budget is satisfied.
+        while self.max_bytes and self.total_bytes > self.max_bytes and len(self._store) > 1:
+            self._store.pop(next(iter(self._store)))
 
 
 def _normalize_cache_url(url: str) -> str:
@@ -379,6 +425,7 @@ class DuckDuckGoSearcher:
         requests_per_minute: int = 30,
         rate_limit_strategy: str = "sliding",
         ref_url_threshold: int = DEFAULT_REF_URL_THRESHOLD,
+        max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES,
         link_registry: Optional[LinkRegistry] = None,
     ):
         """
@@ -413,6 +460,7 @@ class DuckDuckGoSearcher:
         self.backend = backend
         self.ssl_verify = ssl_verify
         self.ref_url_threshold = max(0, int(ref_url_threshold))
+        self.max_content_bytes = max(0, int(max_content_bytes))
         self.links = link_registry if link_registry is not None else links
 
     def format_results_for_llm(self, results: List[SearchResult]) -> str:
@@ -602,7 +650,10 @@ class DuckDuckGoSearcher:
                     self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
                 )
             response.raise_for_status()
-            return response.status_code, response.text
+            # Bound the result page too. No content-type check here: the only
+            # target is DuckDuckGo's own HTML endpoint, and refusing an
+            # unexpected type would break search rather than protect anything.
+            return response.status_code, _cap_text(response.text, self.max_content_bytes)
 
     async def _request_curl(self, data: dict) -> str:
         """POST the search form via curl_cffi with Chrome 131 TLS impersonation."""
@@ -621,7 +672,7 @@ class DuckDuckGoSearcher:
                 await _sleep_retry_after(getattr(response, "headers", None))
                 response = await client.post(self.BASE_URL, data=data, timeout=30.0)
             response.raise_for_status()
-            return response.text
+            return _cap_text(response.text, self.max_content_bytes)
 
 
 # Cloudflare / bot-filter challenge signals that appear in response bodies even
@@ -648,6 +699,81 @@ _MAX_REDIRECTS = 5
 
 # HTTP status codes that carry a Location header we should follow.
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+# Content types fetch_content will parse. Anything else (images, archives, media)
+# would only decode into noise, so it is refused before the body is read.
+_ALLOWED_CONTENT_TYPES = (
+    "text/html",
+    "application/xhtml+xml",
+    "application/xml",
+    "text/xml",
+    "text/plain",
+)
+
+
+class FetchRejectedError(Exception):
+    """Raised when a response is refused on size or content-type grounds."""
+
+
+class FetchedText(str):
+    """Response body that also records whether the byte ceiling cut it short.
+
+    A plain ``str`` subclass so every existing caller keeps working unchanged —
+    including tests that patch the fetch helpers with functions returning bare
+    strings. Read the flag with ``getattr(value, "truncated", False)``.
+    """
+
+    truncated = False
+
+    def __new__(cls, value: str, truncated: bool = False):
+        obj = super().__new__(cls, value)
+        obj.truncated = truncated
+        return obj
+
+
+def _content_type_allowed(content_type: Optional[str]) -> bool:
+    """True when a Content-Type looks like text we can usefully parse.
+
+    A missing or empty header is allowed: plenty of servers omit it, and the
+    parser copes with junk. An explicit non-text type is refused.
+    """
+    if not content_type:
+        return True
+    mime = content_type.split(";")[0].strip().lower()
+    if not mime:
+        return True
+    return mime in _ALLOWED_CONTENT_TYPES or mime.startswith("text/")
+
+
+def _declared_too_large(headers, limit: int) -> Optional[int]:
+    """Return the declared Content-Length when it exceeds ``limit``, else None.
+
+    Lets an oversized response be refused from its headers alone, before any of
+    the body is transferred.
+    """
+    if not limit or headers is None:
+        return None
+    raw = headers.get("content-length")
+    if raw is None:
+        return None
+    try:
+        size = int(str(raw).strip())
+    except ValueError:
+        return None
+    return size if size > limit else None
+
+
+def _cap_text(text: str, limit: int) -> FetchedText:
+    """Bound an already-buffered body to ``limit``.
+
+    Compares character count against a byte limit deliberately: every UTF-8
+    character is at least one byte, so a string within the limit by characters
+    is always within it by bytes. That keeps the check cheap (no re-encoding of
+    a large body just to measure it) and errs toward keeping content.
+    """
+    if not limit or len(text) <= limit:
+        return FetchedText(text, truncated=False)
+    return FetchedText(text[:limit], truncated=True)
 
 
 class BlockedURLError(Exception):
@@ -889,6 +1015,8 @@ class WebContentFetcher:
         rate_limit_strategy: str = "sliding",
         cache_ttl: float = 300.0,
         cache_max_entries: int = 64,
+        cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
+        max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES,
         parse_mode: str = "text",
         link_registry: Optional[LinkRegistry] = None,
     ):
@@ -917,6 +1045,11 @@ class WebContentFetcher:
             cache_ttl: Seconds to keep a parsed page in memory so paginated
                 ``fetch_content`` calls reuse one download. 0 disables the cache.
             cache_max_entries: LRU cap on cached pages. 0 disables the cache.
+            cache_max_bytes: Total size budget for cached page text, so a few very
+                large pages cannot dominate memory. 0 disables the budget.
+            max_content_bytes: Transport-level ceiling on how much of a response is
+                read and parsed. Applied before parsing, unlike ``max_length``
+                which only paginates already-parsed text. 0 disables the limit.
             parse_mode: Default extractor for fetch_content. One of "text"
                 (default, historical), "main" (primary article), or "markdown".
             link_registry: Registry used to resolve ref:// tokens passed as the
@@ -940,7 +1073,12 @@ class WebContentFetcher:
             if host_requests_per_minute > 0
             else None
         )
-        self.cache = TTLCache(ttl_seconds=cache_ttl, max_entries=cache_max_entries)
+        self.cache = TTLCache(
+            ttl_seconds=cache_ttl,
+            max_entries=cache_max_entries,
+            max_bytes=cache_max_bytes,
+        )
+        self.max_content_bytes = max(0, int(max_content_bytes))
         self.default_parse_mode = parse_mode
         self.links = link_registry if link_registry is not None else links
 
@@ -949,38 +1087,91 @@ class WebContentFetcher:
         if not self.allow_private_urls:
             await _validate_public_url(url)
 
-    async def _fetch_httpx(self, url: str) -> str:
+    FETCH_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    def _check_response_limits(self, headers, url: str) -> None:
+        """Refuse a response from its headers alone, before the body is read."""
+        content_type = headers.get("content-type") if headers is not None else None
+        if not _content_type_allowed(content_type):
+            raise FetchRejectedError(
+                f"refusing content type '{content_type}' from {url} — this tool only "
+                "reads HTML, XML, and plain text"
+            )
+        declared = _declared_too_large(headers, self.max_content_bytes)
+        if declared is not None:
+            raise FetchRejectedError(
+                f"{url} declares a {declared}-byte body, over the "
+                f"{self.max_content_bytes}-byte limit (raise --max-content-bytes to allow it)"
+            )
+
+    async def _decode_capped(self, chunks, encoding: Optional[str]) -> FetchedText:
+        """Consume an async byte-chunk iterator up to the ceiling, then decode.
+
+        Stops pulling chunks once the cap is reached rather than buffering the
+        whole body, so an oversized or endless response costs bounded memory.
+        Shared by both backends so their limits can't drift apart.
+        """
+        limit = self.max_content_bytes
+        buffer = bytearray()
+        truncated = False
+        async for chunk in chunks:
+            if limit and len(buffer) + len(chunk) >= limit:
+                buffer.extend(chunk[: max(0, limit - len(buffer))])
+                truncated = True
+                break
+            buffer.extend(chunk)
+        try:
+            text = bytes(buffer).decode(encoding or "utf-8", errors="replace")
+        except LookupError:
+            # Server named a charset Python doesn't know; utf-8 with replacement
+            # still yields usable text rather than failing the whole fetch.
+            text = bytes(buffer).decode("utf-8", errors="replace")
+        return FetchedText(text, truncated=truncated)
+
+    async def _read_capped(self, response) -> FetchedText:
+        """Read a streamed httpx response up to the byte ceiling."""
+        return await self._decode_capped(response.aiter_bytes(), response.charset_encoding)
+
+    async def _hop_httpx(self, client, url: str):
+        """Perform one GET, retrying once on 429.
+
+        Returns ``(body, None)`` for a final response, or ``(None, next_url)``
+        when the response is a redirect that should be followed.
+        """
+        for attempt in range(2):
+            async with client.stream(
+                "GET", url, headers=self.FETCH_HEADERS, timeout=30.0
+            ) as response:
+                if response.status_code == 429 and attempt == 0:
+                    await _sleep_retry_after(response.headers)
+                    continue
+                location = response.headers.get("location")
+                if response.status_code in _REDIRECT_STATUSES and location:
+                    # Never read a redirect's body; the next hop is re-validated.
+                    return None, str(httpx.URL(url).join(location))
+                response.raise_for_status()
+                self._check_response_limits(response.headers, url)
+                return await self._read_capped(response), None
+        raise httpx.HTTPError(f"rate limited by {url} after a retry")
+
+    async def _fetch_httpx(self, url: str) -> FetchedText:
         """Fetch URL via httpx, validating the target and every redirect hop.
 
         Redirects are followed manually (not via follow_redirects=True) so the SSRF
-        guard runs on each hop. Raises httpx.HTTPStatusError on non-2xx.
+        guard runs on each hop, and the body is streamed so an oversized response
+        is abandoned rather than buffered. Raises httpx.HTTPStatusError on non-2xx
+        and FetchRejectedError when size or content-type limits refuse it.
         """
         async with httpx.AsyncClient(follow_redirects=False, verify=self.ssl_verify) as client:
             current = url
             for _ in range(_MAX_REDIRECTS + 1):
                 await self._guard_url(current)
-                response = await client.get(
-                    current,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                    },
-                    timeout=30.0,
-                )
-                if response.status_code == 429:
-                    await _sleep_retry_after(response.headers)
-                    response = await client.get(
-                        current,
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                        },
-                        timeout=30.0,
-                    )
-                location = response.headers.get("location")
-                if response.status_code in _REDIRECT_STATUSES and location:
-                    current = str(httpx.URL(current).join(location))
-                    continue
-                response.raise_for_status()
-                return response.text
+                body, next_url = await self._hop_httpx(client, current)
+                if next_url is None:
+                    return body
+                current = next_url
             raise httpx.HTTPError(f"too many redirects (>{_MAX_REDIRECTS})")
 
     async def _fetch_curl(self, url: str) -> str:
@@ -999,17 +1190,36 @@ class WebContentFetcher:
             current = url
             for _ in range(_MAX_REDIRECTS + 1):
                 await self._guard_url(current)
-                response = await client.get(current, allow_redirects=False, timeout=30.0)
-                if getattr(response, "status_code", None) == 429:
+                body, next_url = await self._hop_curl(client, current)
+                if next_url is None:
+                    return body
+                current = next_url
+            raise httpx.HTTPError(f"too many redirects (>{_MAX_REDIRECTS})")
+
+    async def _hop_curl(self, client, url: str):
+        """One curl_cffi GET, retrying once on 429. Mirrors ``_hop_httpx``.
+
+        curl_cffi 0.15 supports real streaming (``stream=True`` plus
+        ``aiter_content``), so the byte ceiling is enforced the same way here as
+        on the httpx path rather than after buffering the whole body.
+        """
+        for attempt in range(2):
+            async with client.stream(
+                "GET", url, allow_redirects=False, timeout=30.0
+            ) as response:
+                if getattr(response, "status_code", None) == 429 and attempt == 0:
                     await _sleep_retry_after(getattr(response, "headers", None))
-                    response = await client.get(current, allow_redirects=False, timeout=30.0)
+                    continue
                 location = response.headers.get("location")
                 if response.status_code in _REDIRECT_STATUSES and location:
-                    current = urllib.parse.urljoin(current, location)
-                    continue
+                    return None, urllib.parse.urljoin(url, location)
                 response.raise_for_status()
-                return response.text
-            raise httpx.HTTPError(f"too many redirects (>{_MAX_REDIRECTS})")
+                self._check_response_limits(response.headers, url)
+                body = await self._decode_capped(
+                    response.aiter_content(), getattr(response, "encoding", None)
+                )
+                return body, None
+        raise httpx.HTTPError(f"rate limited by {url} after a retry")
 
     async def _fetch_auto(self, url: str, ctx: Context) -> str:
         """
@@ -1082,8 +1292,11 @@ class WebContentFetcher:
             # A cache hit skips _guard_url on purpose: an entry only exists after
             # a guarded fetch of the same normalized URL succeeded under this
             # fetcher's allow_private_urls setting, and no request is made.
-            text = self.cache.get(cache_key) if cache_key is not None else None
-            cache_hit = text is not None
+            cached = self.cache.get(cache_key) if cache_key is not None else None
+            cache_hit = cached is not None
+            # Cached as (text, hit_byte_ceiling) so a cache hit reports transport
+            # truncation just as the original download did.
+            text, transport_truncated = cached if cache_hit else (None, False)
 
             if not cache_hit:
                 if self.host_limiter is not None:
@@ -1102,9 +1315,12 @@ class WebContentFetcher:
                 else:  # auto
                     html = await self._fetch_auto(url, ctx)
 
+                transport_truncated = bool(getattr(html, "truncated", False))
                 text = _html_to_text(html, effective_mode)
                 if cache_key is not None:
-                    self.cache.set(cache_key, text)
+                    self.cache.set(
+                        cache_key, (text, transport_truncated), size=len(text)
+                    )
             else:
                 await ctx.info(
                     f"Cache hit for {url} "
@@ -1130,6 +1346,13 @@ class WebContentFetcher:
                 metadata += f" | cache={cache_note}"
             if effective_mode != "text":
                 metadata += f" | parse={effective_mode}"
+            if transport_truncated:
+                # Distinct from pagination: the page itself was cut off at the
+                # download limit, so later start_index values can't reveal the rest.
+                metadata += (
+                    f" | page exceeded the {self.max_content_bytes}-byte download "
+                    "limit and was truncated before parsing"
+                )
             metadata += "]"
             text += metadata
 
@@ -1145,6 +1368,9 @@ class WebContentFetcher:
                 "private/internal addresses to prevent SSRF. If this is a trusted local "
                 "deployment, set DDG_ALLOW_PRIVATE_URLS=1 (or pass --allow-private-urls)."
             )
+        except FetchRejectedError as e:
+            await ctx.error(f"Rejected fetch for {url}: {e}")
+            return f"Error: {e}."
         except httpx.TimeoutException:
             await ctx.error(f"Request timed out for URL: {url}")
             return "Error: The request timed out while trying to fetch the webpage."
@@ -1253,6 +1479,8 @@ FETCH_HOST_RPM = _env_int("DDG_FETCH_HOST_RPM", 0, minimum=0)
 RATE_LIMIT_STRATEGY = os.getenv("DDG_RATE_LIMIT_STRATEGY", "sliding").strip().lower() or "sliding"
 CACHE_TTL = _env_int("DDG_CACHE_TTL", 300, minimum=0)
 CACHE_MAX_ENTRIES = _env_int("DDG_CACHE_MAX_ENTRIES", 64, minimum=0)
+CACHE_MAX_BYTES = _env_int("DDG_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES, minimum=0)
+MAX_CONTENT_BYTES = _env_int("DDG_MAX_CONTENT_BYTES", DEFAULT_MAX_CONTENT_BYTES, minimum=0)
 PARSE_MODE = os.getenv("DDG_PARSE_MODE", "text").strip().lower() or "text"
 REF_URL_THRESHOLD = _env_int("DDG_REF_URL_THRESHOLD", DEFAULT_REF_URL_THRESHOLD, minimum=0)
 
@@ -1290,6 +1518,7 @@ searcher = DuckDuckGoSearcher(
     requests_per_minute=SEARCH_RPM,
     rate_limit_strategy=RATE_LIMIT_STRATEGY,
     ref_url_threshold=REF_URL_THRESHOLD,
+    max_content_bytes=MAX_CONTENT_BYTES,
 )
 fetcher = WebContentFetcher(
     allow_private_urls=ALLOW_PRIVATE_URLS,
@@ -1299,6 +1528,8 @@ fetcher = WebContentFetcher(
     rate_limit_strategy=RATE_LIMIT_STRATEGY,
     cache_ttl=CACHE_TTL,
     cache_max_entries=CACHE_MAX_ENTRIES,
+    cache_max_bytes=CACHE_MAX_BYTES,
+    max_content_bytes=MAX_CONTENT_BYTES,
     parse_mode=PARSE_MODE,
 )
 
@@ -1311,7 +1542,12 @@ print(
     f"fetch={FETCH_RPM}/min host={FETCH_HOST_RPM}/min",
     file=sys.stderr,
 )
-print(f"  Content cache: ttl={CACHE_TTL}s max_entries={CACHE_MAX_ENTRIES}", file=sys.stderr)
+print(
+    f"  Content cache: ttl={CACHE_TTL}s max_entries={CACHE_MAX_ENTRIES} "
+    f"max_bytes={CACHE_MAX_BYTES}",
+    file=sys.stderr,
+)
+print(f"  Max content bytes: {MAX_CONTENT_BYTES or 'unlimited'}", file=sys.stderr)
 print(f"  Parse mode: {PARSE_MODE}", file=sys.stderr)
 print(f"  Long URL shortening: {'off' if not REF_URL_THRESHOLD else f'>{REF_URL_THRESHOLD} chars -> ref:// tokens'}", file=sys.stderr)
 if SSL_VERIFY is not True:
@@ -1503,6 +1739,29 @@ def main():
         ),
     )
     parser.add_argument(
+        "--cache-max-bytes",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help=(
+            f"Total size budget for text held in the fetch_content cache (default: "
+            f"{DEFAULT_CACHE_MAX_BYTES}, or DDG_CACHE_MAX_BYTES). Stops a few very "
+            "large pages from dominating memory. Set 0 to disable the budget."
+        ),
+    )
+    parser.add_argument(
+        "--max-content-bytes",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help=(
+            f"Maximum bytes read from a single response before the rest is dropped "
+            f"(default: {DEFAULT_MAX_CONTENT_BYTES}, or DDG_MAX_CONTENT_BYTES). "
+            "Applied while downloading, unlike max_length which only paginates "
+            "already-parsed text. Set 0 for no limit."
+        ),
+    )
+    parser.add_argument(
         "--parse-mode",
         choices=list(SUPPORTED_PARSE_MODES),
         default=None,
@@ -1593,6 +1852,10 @@ def main():
         parser.error("--cache-ttl must be >= 0")
     if args.cache_max_entries is not None and args.cache_max_entries < 0:
         parser.error("--cache-max-entries must be >= 0")
+    if args.cache_max_bytes is not None and args.cache_max_bytes < 0:
+        parser.error("--cache-max-bytes must be >= 0")
+    if args.max_content_bytes is not None and args.max_content_bytes < 0:
+        parser.error("--max-content-bytes must be >= 0")
     if args.ref_url_threshold is not None and args.ref_url_threshold < 0:
         parser.error("--ref-url-threshold must be >= 0")
 
@@ -1606,6 +1869,12 @@ def main():
     cache_ttl = args.cache_ttl if args.cache_ttl is not None else CACHE_TTL
     cache_max_entries = (
         args.cache_max_entries if args.cache_max_entries is not None else CACHE_MAX_ENTRIES
+    )
+    cache_max_bytes = (
+        args.cache_max_bytes if args.cache_max_bytes is not None else CACHE_MAX_BYTES
+    )
+    max_content_bytes = (
+        args.max_content_bytes if args.max_content_bytes is not None else MAX_CONTENT_BYTES
     )
     parse_mode = args.parse_mode if args.parse_mode is not None else PARSE_MODE
     ref_url_threshold = (
@@ -1624,6 +1893,8 @@ def main():
         rate_limit_strategy=rate_strategy,
         cache_ttl=cache_ttl,
         cache_max_entries=cache_max_entries,
+        cache_max_bytes=cache_max_bytes,
+        max_content_bytes=max_content_bytes,
         parse_mode=parse_mode,
     )
     print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
@@ -1634,9 +1905,11 @@ def main():
         file=sys.stderr,
     )
     print(
-        f"  Content cache: ttl={cache_ttl}s max_entries={cache_max_entries}",
+        f"  Content cache: ttl={cache_ttl}s max_entries={cache_max_entries} "
+        f"max_bytes={cache_max_bytes}",
         file=sys.stderr,
     )
+    print(f"  Max content bytes: {max_content_bytes or 'unlimited'}", file=sys.stderr)
     print(f"  Parse mode: {parse_mode}", file=sys.stderr)
     if ssl_verify is not True:
         print(f"  SSL verify: {ssl_verify}", file=sys.stderr)
@@ -1649,6 +1922,7 @@ def main():
         or args.search_rpm is not None
         or args.rate_limit_strategy is not None
         or args.ref_url_threshold is not None
+        or args.max_content_bytes is not None
     )
     if rebuild_searcher:
         searcher = DuckDuckGoSearcher(
@@ -1659,6 +1933,7 @@ def main():
             requests_per_minute=search_rpm,
             rate_limit_strategy=rate_strategy,
             ref_url_threshold=ref_url_threshold,
+            max_content_bytes=max_content_bytes,
         )
         print(f"  Search backend: {searcher.backend}", file=sys.stderr)
         print(
