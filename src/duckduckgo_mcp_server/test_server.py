@@ -45,6 +45,8 @@ from duckduckgo_mcp_server.server import (
     _strip_invisible_chars,
     _wrap_untrusted,
     _neutralize_envelope_markers,
+    SUPPORTED_URL_POLICIES,
+    DEFAULT_MAX_URL_LENGTH,
     FetchRejectedError,
     FetchedText,
     _cap_text,
@@ -1168,6 +1170,166 @@ def _patch_backend_client(backend, *, get_return_value=None, get_side_effect=Non
     elif backend == "curl":
         return patch("curl_cffi.requests.AsyncSession", return_value=mock_client)
     raise ValueError(f"no patcher for backend {backend!r}")
+
+
+class TestFetchUrlPolicy(unittest.TestCase):
+    """tokens policy: the model holds opaque handles minted before any secret was
+    known, so it has no field in which to encode data into an outbound request."""
+
+    def test_tokens_policy_refuses_a_raw_url_without_fetching(self):
+        fetcher = WebContentFetcher(allow_private_urls=True, url_policy="tokens")
+        with patch.object(fetcher, "_fetch_httpx", new_callable=AsyncMock) as mock_fetch:
+            result = asyncio.run(
+                fetcher.fetch_and_parse(
+                    "https://example.com/?stolen=" + "A" * 100, DummyCtx()
+                )
+            )
+        mock_fetch.assert_not_called()
+        self.assertTrue(result.startswith("Error"), f"got: {result!r}")
+        self.assertIn("fetch_url_policy=tokens", result)
+
+    def test_tokens_policy_accepts_a_minted_token(self):
+        registry = LinkRegistry()
+        url, stop = _serve_html("<html><body><p>via token</p></body></html>")
+        try:
+            token = registry.shorten(url)
+            fetcher = WebContentFetcher(
+                allow_private_urls=True, url_policy="tokens", link_registry=registry
+            )
+            result = asyncio.run(fetcher.fetch_and_parse(token, DummyCtx()))
+        finally:
+            stop()
+        self.assertIn("via token", result)
+
+    def test_any_policy_still_accepts_raw_urls(self):
+        url, stop = _serve_html("<html><body><p>direct</p></body></html>")
+        try:
+            fetcher = WebContentFetcher(allow_private_urls=True)  # default policy
+            self.assertEqual(fetcher.url_policy, "any")
+            result = asyncio.run(fetcher.fetch_and_parse(url, DummyCtx()))
+        finally:
+            stop()
+        self.assertIn("direct", result)
+
+    def test_unknown_token_is_refused_under_both_policies(self):
+        for policy in SUPPORTED_URL_POLICIES:
+            with self.subTest(policy=policy):
+                fetcher = WebContentFetcher(allow_private_urls=True, url_policy=policy)
+                with patch.object(fetcher, "_fetch_httpx", new_callable=AsyncMock) as m:
+                    result = asyncio.run(
+                        fetcher.fetch_and_parse("ref://deadbeef", DummyCtx())
+                    )
+                m.assert_not_called()
+                self.assertIn("Unknown link reference", result)
+
+    def test_search_mints_a_token_for_every_result_under_tokens_policy(self):
+        registry = LinkRegistry()
+        searcher = DuckDuckGoSearcher(
+            url_policy="tokens", content_envelope=False, link_registry=registry
+        )
+        results = [
+            SearchResult(title="A", link="https://example.com/s", snippet="x", position=1),
+            SearchResult(title="B", link="https://other.example/t", snippet="y", position=2),
+        ]
+        out = searcher.format_results_for_llm(results)
+        tokens = re.findall(r"ref://[0-9a-f]+", out)
+        self.assertEqual(len(tokens), 2)
+        # Short URLs would normally be shown verbatim; under tokens they are not.
+        self.assertNotIn("https://example.com/s", out)
+        # The host stays visible so the model can still cite the source.
+        self.assertIn("example.com", out)
+        self.assertEqual(registry.resolve(tokens[0]), "https://example.com/s")
+
+    def test_any_policy_leaves_short_urls_alone(self):
+        searcher = DuckDuckGoSearcher(content_envelope=False)
+        out = searcher.format_results_for_llm(
+            [SearchResult(title="A", link="https://example.com/s", snippet="x", position=1)]
+        )
+        self.assertIn("https://example.com/s", out)
+        self.assertNotIn("ref://", out)
+
+    def test_round_trip_search_to_token_to_fetch(self):
+        url, stop = _serve_html("<html><body><p>round trip body</p></body></html>")
+        try:
+            registry = LinkRegistry()
+            searcher = DuckDuckGoSearcher(
+                url_policy="tokens", content_envelope=False, link_registry=registry
+            )
+            listing = searcher.format_results_for_llm(
+                [SearchResult(title="T", link=url, snippet="s", position=1)]
+            )
+            token = re.search(r"ref://[0-9a-f]+", listing).group(0)
+            fetcher = WebContentFetcher(
+                allow_private_urls=True, url_policy="tokens", link_registry=registry
+            )
+            result = asyncio.run(fetcher.fetch_and_parse(token, DummyCtx()))
+        finally:
+            stop()
+        self.assertIn("round trip body", result)
+
+    def test_invalid_policy_is_rejected(self):
+        with self.assertRaises(ValueError):
+            WebContentFetcher(url_policy="nope")
+        with self.assertRaises(ValueError):
+            DuckDuckGoSearcher(url_policy="nope")
+
+
+class TestUrlLengthCap(unittest.TestCase):
+    def test_over_long_url_is_refused_before_any_request(self):
+        fetcher = WebContentFetcher(allow_private_urls=True, max_url_length=100)
+        long_url = "https://example.com/?d=" + "A" * 500
+        with patch("httpx.AsyncClient") as mock_client:
+            result = asyncio.run(fetcher.fetch_and_parse(long_url, DummyCtx()))
+        mock_client.return_value.stream.assert_not_called()
+        self.assertIn("Refusing to fetch", result)
+        self.assertIn("over the 100-character limit", result)
+
+    def test_cap_applies_even_when_private_urls_are_allowed(self):
+        # The cap is about what leaves in a query string, not about where it goes.
+        fetcher = WebContentFetcher(allow_private_urls=True, max_url_length=50)
+        result = asyncio.run(
+            fetcher.fetch_and_parse("http://127.0.0.1/" + "b" * 200, DummyCtx())
+        )
+        self.assertIn("over the 50-character limit", result)
+
+    def test_cap_applies_to_redirect_targets(self):
+        fetcher = WebContentFetcher(allow_private_urls=True, max_url_length=120)
+        redirect = MagicMock()
+        redirect.status_code = 302
+        redirect.headers = {"location": "https://example.com/?d=" + "C" * 300}
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(
+            side_effect=lambda *a, **k: _FakeStream(response=redirect)
+        )
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = asyncio.run(
+                fetcher.fetch_and_parse("https://example.com/start", DummyCtx())
+            )
+        self.assertIn("over the 120-character limit", result)
+
+    def test_zero_disables_the_cap(self):
+        fetcher = WebContentFetcher(allow_private_urls=True, max_url_length=0)
+        self.assertEqual(fetcher.max_url_length, 0)
+        with patch.object(fetcher, "_fetch_httpx", new_callable=AsyncMock) as mock_fetch:
+            mock_fetch.return_value = "<html><body><p>ok</p></body></html>"
+            result = asyncio.run(
+                fetcher.fetch_and_parse("https://example.com/?d=" + "A" * 5000, DummyCtx())
+            )
+        mock_fetch.assert_called_once()
+        self.assertIn("ok", result)
+
+    def test_default_cap_is_applied(self):
+        self.assertEqual(WebContentFetcher().max_url_length, DEFAULT_MAX_URL_LENGTH)
+
+    def test_ordinary_urls_are_unaffected(self):
+        url, stop = _serve_html("<html><body><p>normal</p></body></html>")
+        try:
+            fetcher = WebContentFetcher(allow_private_urls=True)
+            self.assertIn("normal", asyncio.run(fetcher.fetch_and_parse(url, DummyCtx())))
+        finally:
+            stop()
 
 
 class TestUntrustedEnvelope(unittest.TestCase):

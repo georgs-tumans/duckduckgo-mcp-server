@@ -157,6 +157,26 @@ def is_ref_token(value: str) -> bool:
     return (value or "").strip().lower().startswith(REF_SCHEME)
 
 
+# How fetch_content decides which URLs it will accept.
+#   any    - any public http(s) URL (historical behaviour)
+#   tokens - only ref:// tokens this server minted from its own search results
+SUPPORTED_URL_POLICIES = ("any", "tokens")
+
+# Refuse absurdly long URLs. A query string is the natural place to smuggle data
+# out of the model's context, and no legitimate page needs kilobytes of it.
+DEFAULT_MAX_URL_LENGTH = 2048
+
+
+def _tokens_only_error(url: str) -> str:
+    return (
+        "Error: this server runs with fetch_url_policy=tokens, so fetch_content "
+        "accepts only ref:// tokens it issued from its own search results. Raw "
+        "URLs are refused — including links found inside a fetched page and URLs "
+        f"pasted by the user ('{(url or '').strip()[:80]}'). Run search first and "
+        "pass the ref:// token of the result you want."
+    )
+
+
 def _unknown_ref_error(token: str) -> str:
     return (
         f"Error: Unknown link reference '{(token or '').strip()}'. Only ref:// tokens "
@@ -474,6 +494,7 @@ class DuckDuckGoSearcher:
         ref_url_threshold: int = DEFAULT_REF_URL_THRESHOLD,
         max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES,
         content_envelope: bool = True,
+        url_policy: str = "any",
         link_registry: Optional[LinkRegistry] = None,
     ):
         """
@@ -510,6 +531,11 @@ class DuckDuckGoSearcher:
         self.ref_url_threshold = max(0, int(ref_url_threshold))
         self.max_content_bytes = max(0, int(max_content_bytes))
         self.content_envelope = bool(content_envelope)
+        if url_policy not in SUPPORTED_URL_POLICIES:
+            raise ValueError(
+                f"Unknown URL policy '{url_policy}'. Supported: {SUPPORTED_URL_POLICIES}"
+            )
+        self.url_policy = url_policy
         self.links = link_registry if link_registry is not None else links
 
     def format_results_for_llm(self, results: List[SearchResult]) -> str:
@@ -547,7 +573,17 @@ class DuckDuckGoSearcher:
         return _wrap_untrusted(body) if self.content_envelope else body
 
     def _display_url(self, url: str) -> str:
-        """Replace an over-long URL with a ref:// token (see LinkRegistry)."""
+        """Replace a URL with a ref:// token (see LinkRegistry).
+
+        Under the "tokens" policy every result is tokenised, not just over-long
+        ones: fetch_content will accept nothing else, so a raw URL in the output
+        would only be a dead end. The host is shown alongside so the model can
+        still tell the user (and itself) where a result comes from.
+        """
+        if self.url_policy == "tokens":
+            token = self.links.shorten(url)
+            host = urllib.parse.urlsplit(url).hostname or "unknown host"
+            return f"{token} ({host} — pass to fetch_content as-is; expand_link gives the full URL)"
         if not self.ref_url_threshold or len(url) <= self.ref_url_threshold:
             return url
         token = self.links.shorten(url)
@@ -1148,6 +1184,8 @@ class WebContentFetcher:
         cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
         max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES,
         content_envelope: bool = True,
+        url_policy: str = "any",
+        max_url_length: int = DEFAULT_MAX_URL_LENGTH,
         parse_mode: str = "text",
         link_registry: Optional[LinkRegistry] = None,
     ):
@@ -1211,11 +1249,27 @@ class WebContentFetcher:
         )
         self.max_content_bytes = max(0, int(max_content_bytes))
         self.content_envelope = bool(content_envelope)
+        if url_policy not in SUPPORTED_URL_POLICIES:
+            raise ValueError(
+                f"Unknown URL policy '{url_policy}'. Supported: {SUPPORTED_URL_POLICIES}"
+            )
+        self.url_policy = url_policy
+        self.max_url_length = max(0, int(max_url_length))
         self.default_parse_mode = parse_mode
         self.links = link_registry if link_registry is not None else links
 
     async def _guard_url(self, url: str) -> None:
-        """Apply the SSRF guard unless private URLs are explicitly allowed."""
+        """Per-hop URL checks: length cap, then the SSRF guard.
+
+        The length cap applies even when private URLs are allowed — it is about
+        what can be carried *out* in a query string, not about where the request
+        goes, and it runs on redirect targets as well as the initial URL.
+        """
+        if self.max_url_length and len(url) > self.max_url_length:
+            raise BlockedURLError(
+                f"URL is {len(url)} characters, over the {self.max_url_length}-character "
+                "limit (over-long URLs are how data gets smuggled out in a query string)"
+            )
         if not self.allow_private_urls:
             await _validate_public_url(url)
 
@@ -1401,6 +1455,10 @@ class WebContentFetcher:
             if resolved is None:
                 return _unknown_ref_error(url)
             url = resolved
+        elif self.url_policy == "tokens":
+            # The model holds opaque handles minted before any secret was known,
+            # so it has no field in which to encode data into a request.
+            return _tokens_only_error(url)
 
         effective_backend = backend if backend is not None else self.default_backend
         if effective_backend not in SUPPORTED_FETCH_BACKENDS:
@@ -1611,12 +1669,14 @@ SSL_VERIFY_ENABLED = os.getenv("DDG_SSL_VERIFY", "1").strip().lower() not in ("0
 SSL_VERIFY = _resolve_ssl_verify(CA_CERTS, SSL_VERIFY_ENABLED)
 SEARCH_RPM = _env_int("DDG_SEARCH_RPM", 30, minimum=1)
 FETCH_RPM = _env_int("DDG_FETCH_RPM", 20, minimum=1)
-FETCH_HOST_RPM = _env_int("DDG_FETCH_HOST_RPM", 0, minimum=0)
+FETCH_HOST_RPM = _env_int("DDG_FETCH_HOST_RPM", 6, minimum=0)
 RATE_LIMIT_STRATEGY = os.getenv("DDG_RATE_LIMIT_STRATEGY", "sliding").strip().lower() or "sliding"
 CACHE_TTL = _env_int("DDG_CACHE_TTL", 300, minimum=0)
 CACHE_MAX_ENTRIES = _env_int("DDG_CACHE_MAX_ENTRIES", 64, minimum=0)
 CACHE_MAX_BYTES = _env_int("DDG_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES, minimum=0)
 MAX_CONTENT_BYTES = _env_int("DDG_MAX_CONTENT_BYTES", DEFAULT_MAX_CONTENT_BYTES, minimum=0)
+URL_POLICY = os.getenv("DDG_FETCH_URL_POLICY", "any").strip().lower() or "any"
+MAX_URL_LENGTH = _env_int("DDG_MAX_URL_LENGTH", DEFAULT_MAX_URL_LENGTH, minimum=0)
 CONTENT_ENVELOPE = os.getenv("DDG_CONTENT_ENVELOPE", "on").strip().lower() not in (
     "0",
     "false",
@@ -1648,6 +1708,13 @@ if RATE_LIMIT_STRATEGY not in SUPPORTED_RATE_STRATEGIES:
     )
     RATE_LIMIT_STRATEGY = "sliding"
 
+if URL_POLICY not in SUPPORTED_URL_POLICIES:
+    print(
+        f"Warning: Invalid DDG_FETCH_URL_POLICY value '{URL_POLICY}', using any",
+        file=sys.stderr,
+    )
+    URL_POLICY = "any"
+
 if PARSE_MODE not in SUPPORTED_PARSE_MODES:
     print(f"Warning: Invalid DDG_PARSE_MODE value '{PARSE_MODE}', using text", file=sys.stderr)
     PARSE_MODE = "text"
@@ -1662,6 +1729,7 @@ searcher = DuckDuckGoSearcher(
     ref_url_threshold=REF_URL_THRESHOLD,
     max_content_bytes=MAX_CONTENT_BYTES,
     content_envelope=CONTENT_ENVELOPE,
+    url_policy=URL_POLICY,
 )
 fetcher = WebContentFetcher(
     allow_private_urls=ALLOW_PRIVATE_URLS,
@@ -1674,6 +1742,8 @@ fetcher = WebContentFetcher(
     cache_max_bytes=CACHE_MAX_BYTES,
     max_content_bytes=MAX_CONTENT_BYTES,
     content_envelope=CONTENT_ENVELOPE,
+    url_policy=URL_POLICY,
+    max_url_length=MAX_URL_LENGTH,
     parse_mode=PARSE_MODE,
 )
 
@@ -1694,6 +1764,7 @@ print(
 print(f"  Max content bytes: {MAX_CONTENT_BYTES or 'unlimited'}", file=sys.stderr)
 print(f"  Parse mode: {PARSE_MODE}", file=sys.stderr)
 print(f"  Untrusted-content envelope: {'on' if CONTENT_ENVELOPE else 'off'}", file=sys.stderr)
+print(f"  Fetch URL policy: {URL_POLICY} (max URL length {MAX_URL_LENGTH or 'unlimited'})", file=sys.stderr)
 print(f"  Untrusted-content envelope: {'on' if CONTENT_ENVELOPE else 'off'}", file=sys.stderr)
 print(f"  Long URL shortening: {'off' if not REF_URL_THRESHOLD else f'>{REF_URL_THRESHOLD} chars -> ref:// tokens'}", file=sys.stderr)
 if SSL_VERIFY is not True:
@@ -1908,6 +1979,29 @@ def main():
         ),
     )
     parser.add_argument(
+        "--fetch-url-policy",
+        choices=list(SUPPORTED_URL_POLICIES),
+        default=None,
+        help=(
+            "Which URLs fetch_content accepts. 'any' (default) allows any public "
+            "http(s) URL. 'tokens' accepts only ref:// tokens this server minted "
+            "from its own search results, which removes the model's ability to "
+            "encode data into an outbound request — at the cost of not being able "
+            "to follow links found inside a page or fetch a URL the user pasted. "
+            "Also DDG_FETCH_URL_POLICY."
+        ),
+    )
+    parser.add_argument(
+        "--max-url-length",
+        type=int,
+        default=None,
+        metavar="CHARS",
+        help=(
+            f"Refuse URLs longer than this (default: {DEFAULT_MAX_URL_LENGTH}, or "
+            "DDG_MAX_URL_LENGTH). Applies to redirect targets too. Set 0 for no limit."
+        ),
+    )
+    parser.add_argument(
         "--content-envelope",
         choices=["on", "off"],
         default=None,
@@ -2013,6 +2107,8 @@ def main():
         parser.error("--cache-max-bytes must be >= 0")
     if args.max_content_bytes is not None and args.max_content_bytes < 0:
         parser.error("--max-content-bytes must be >= 0")
+    if args.max_url_length is not None and args.max_url_length < 0:
+        parser.error("--max-url-length must be >= 0")
     if args.ref_url_threshold is not None and args.ref_url_threshold < 0:
         parser.error("--ref-url-threshold must be >= 0")
 
@@ -2032,6 +2128,10 @@ def main():
     )
     max_content_bytes = (
         args.max_content_bytes if args.max_content_bytes is not None else MAX_CONTENT_BYTES
+    )
+    url_policy = args.fetch_url_policy or URL_POLICY
+    max_url_length = (
+        args.max_url_length if args.max_url_length is not None else MAX_URL_LENGTH
     )
     content_envelope = (
         (args.content_envelope == "on")
@@ -2058,6 +2158,8 @@ def main():
         cache_max_bytes=cache_max_bytes,
         max_content_bytes=max_content_bytes,
         content_envelope=content_envelope,
+        url_policy=url_policy,
+        max_url_length=max_url_length,
         parse_mode=parse_mode,
     )
     print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
@@ -2074,6 +2176,11 @@ def main():
     )
     print(f"  Max content bytes: {max_content_bytes or 'unlimited'}", file=sys.stderr)
     print(f"  Parse mode: {parse_mode}", file=sys.stderr)
+    print(
+        f"  Fetch URL policy: {url_policy} "
+        f"(max URL length {max_url_length or 'unlimited'})",
+        file=sys.stderr,
+    )
     if ssl_verify is not True:
         print(f"  SSL verify: {ssl_verify}", file=sys.stderr)
 
@@ -2087,6 +2194,7 @@ def main():
         or args.ref_url_threshold is not None
         or args.max_content_bytes is not None
         or args.content_envelope is not None
+        or args.fetch_url_policy is not None
     )
     if rebuild_searcher:
         searcher = DuckDuckGoSearcher(
@@ -2099,6 +2207,7 @@ def main():
             ref_url_threshold=ref_url_threshold,
             max_content_bytes=max_content_bytes,
             content_envelope=content_envelope,
+            url_policy=url_policy,
         )
         print(f"  Search backend: {searcher.backend}", file=sys.stderr)
         print(
