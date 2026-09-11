@@ -1672,6 +1672,7 @@ SAFE_SEARCH_MODE = os.getenv("DDG_SAFE_SEARCH", "MODERATE").upper()
 REGION_CODE = os.getenv("DDG_REGION", "")
 ALLOW_PRIVATE_URLS = _env_flag("DDG_ALLOW_PRIVATE_URLS")
 SEARCH_BACKEND = os.getenv("DDG_SEARCH_BACKEND", "auto").lower()
+FETCH_BACKEND = os.getenv("DDG_FETCH_BACKEND", "httpx").lower()
 ALLOWED_HOSTS = _split_env_list("DDG_ALLOWED_HOSTS")
 ALLOWED_ORIGINS = _split_env_list("DDG_ALLOWED_ORIGINS")
 DISABLE_DNS_REBINDING = _env_flag("DDG_DISABLE_DNS_REBINDING_PROTECTION")
@@ -1712,6 +1713,13 @@ if SEARCH_BACKEND not in SUPPORTED_FETCH_BACKENDS:
     print(f"Warning: Invalid DDG_SEARCH_BACKEND value '{SEARCH_BACKEND}', using auto", file=sys.stderr)
     SEARCH_BACKEND = "auto"
 
+# Validate fetch backend. This has an env var for parity with DDG_SEARCH_BACKEND:
+# MCP clients are normally configured with an env block, so a CLI-only setting is
+# unreachable from a typical client config.
+if FETCH_BACKEND not in SUPPORTED_FETCH_BACKENDS:
+    print(f"Warning: Invalid DDG_FETCH_BACKEND value '{FETCH_BACKEND}', using httpx", file=sys.stderr)
+    FETCH_BACKEND = "httpx"
+
 if RATE_LIMIT_STRATEGY not in SUPPORTED_RATE_STRATEGIES:
     print(
         f"Warning: Invalid DDG_RATE_LIMIT_STRATEGY value '{RATE_LIMIT_STRATEGY}', using sliding",
@@ -1743,6 +1751,7 @@ searcher = DuckDuckGoSearcher(
     url_policy=URL_POLICY,
 )
 fetcher = WebContentFetcher(
+    backend=FETCH_BACKEND,
     allow_private_urls=ALLOW_PRIVATE_URLS,
     ssl_verify=SSL_VERIFY,
     requests_per_minute=FETCH_RPM,
@@ -1762,6 +1771,7 @@ print("DuckDuckGo MCP Server initialized:", file=sys.stderr)
 print(f"  SafeSearch: {safe_search.name} (kp={safe_search.value})", file=sys.stderr)
 print(f"  Default Region: {REGION_CODE or 'none'}", file=sys.stderr)
 print(f"  Search backend: {searcher.backend}", file=sys.stderr)
+print(f"  Fetch backend: {fetcher.default_backend}", file=sys.stderr)
 print(
     f"  Rate limit: strategy={RATE_LIMIT_STRATEGY} search={SEARCH_RPM}/min "
     f"fetch={FETCH_RPM}/min host={FETCH_HOST_RPM}/min",
@@ -1861,14 +1871,14 @@ def main():
     parser.add_argument(
         "--fetch-backend",
         choices=list(SUPPORTED_FETCH_BACKENDS),
-        default="httpx",
+        default=None,
         help=(
             "Default HTTP backend for fetch_content. 'httpx' (default) is lightweight. "
             "'curl' uses curl_cffi with Chrome TLS impersonation to bypass bot filters "
             "(Cloudflare Bot Management, etc.) and requires the [browser] extra. "
             "'auto' tries httpx first and falls back to curl on 403 / Cloudflare "
             "challenge. Individual fetch_content calls can override this via their "
-            "'backend' argument."
+            "'backend' argument. Also settable via DDG_FETCH_BACKEND."
         ),
     )
     parser.add_argument(
@@ -2140,6 +2150,7 @@ def main():
     max_content_bytes = (
         args.max_content_bytes if args.max_content_bytes is not None else MAX_CONTENT_BYTES
     )
+    fetch_backend = args.fetch_backend or FETCH_BACKEND
     url_policy = args.fetch_url_policy or URL_POLICY
     max_url_length = (
         args.max_url_length if args.max_url_length is not None else MAX_URL_LENGTH
@@ -2158,7 +2169,7 @@ def main():
     # access is enabled if either the env var or the CLI flag is set.
     allow_private = ALLOW_PRIVATE_URLS or args.allow_private_urls
     fetcher = WebContentFetcher(
-        backend=args.fetch_backend,
+        backend=fetch_backend,
         allow_private_urls=allow_private,
         ssl_verify=ssl_verify,
         requests_per_minute=fetch_rpm,
