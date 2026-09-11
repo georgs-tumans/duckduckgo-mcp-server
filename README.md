@@ -141,6 +141,71 @@ Or set `DDG_CA_CERTS=/path/to/proxy-ca.pem`. The bundle is used by both the `sea
 
 As a last resort, `--no-ssl-verify` (or `DDG_SSL_VERIFY=0`) disables certificate verification entirely. This exposes traffic to interception by anyone on the network path — prefer `--ca-certs`.
 
+### Running in a container
+
+The repo ships a `Dockerfile`, and CI publishes a multi-arch image to GHCR. Build it yourself:
+
+```bash
+podman build -t duckduckgo-mcp-server .
+```
+
+Or pull the published image:
+
+```bash
+podman pull ghcr.io/georgs-tumans/duckduckgo-mcp-server:latest
+```
+
+Swap `podman` for `docker` throughout if that is what you run.
+
+#### Wiring it into an MCP client
+
+A ready-to-copy config is in [`example.mcp.json`](example.mcp.json). Copy the `ddg-search` entry into your client's config - LM Studio's `mcp.json`, Claude Desktop's `claude_desktop_config.json`, or a project `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "ddg-search": {
+      "command": "podman",
+      "args": [
+        "run", "-i", "--rm",
+        "--read-only", "--tmpfs", "/tmp",
+        "--cap-drop=ALL", "--security-opt=no-new-privileges",
+        "--user", "1000:1000",
+        "--memory=512m", "--pids-limit=128",
+        "-e", "DDG_SAFE_SEARCH=MODERATE",
+        "-e", "DDG_PARSE_MODE=markdown",
+        "-e", "DDG_MAX_CONTENT_BYTES=5000000",
+        "-e", "DDG_FETCH_HOST_RPM=6",
+        "ghcr.io/georgs-tumans/duckduckgo-mcp-server:latest"
+      ]
+    }
+  }
+}
+```
+
+To use the stricter [token-only URL policy](#notes-on-the-security-settings), add `"-e", "DDG_FETCH_URL_POLICY=tokens"` - but read the tradeoff first: the model will no longer be able to follow links inside a page or fetch URLs you paste.
+
+#### Two things that trip people up
+
+**`-i` is required.** The server speaks MCP over stdio, so the container needs stdin held open. Without `-i` it appears to start and then hangs with no error.
+
+**The `env` block does not reach the container.** In an `.mcp.json`, `env` sets variables for the `podman` process, not for the process inside the container. Either pass values inline in `args` as above, or forward them by bare name:
+
+```json
+"args": ["run", "-i", "--rm", "-e", "DDG_SAFE_SEARCH", "ghcr.io/georgs-tumans/duckduckgo-mcp-server:latest"],
+"env": { "DDG_SAFE_SEARCH": "STRICT" }
+```
+
+A bare `-e NAME` (no `=`) forwards the value from the surrounding environment; `-e NAME=value` sets it directly and ignores the `env` block.
+
+#### About the hardening flags
+
+`--read-only`, `--cap-drop=ALL`, `--security-opt=no-new-privileges` and `--user 1000:1000` are ordinary least-privilege settings; the image is built to run fine under all of them, writing nothing outside `/tmp`.
+
+`--memory=512m` is defence-in-depth for response size. The server already caps downloads at `DDG_MAX_CONTENT_BYTES`, but a memory ceiling means a pathological page gets the *container* OOM-killed rather than pressuring the host. The two are complementary. (On rootless Podman, memory limits need cgroups v2 delegation; if yours warns and ignores the flag, the in-process cap still applies.)
+
+**The container is not an SSRF boundary.** Rootless Podman networking can still reach your LAN, so leave `DDG_ALLOW_PRIVATE_URLS` unset - the server's own guard is what keeps `fetch_content` away from internal addresses, not the container.
+
 ### Backends (bypassing bot detection)
 
 Some sites — and, as of recently, DuckDuckGo's own search endpoint (`html.duckduckgo.com`) — block the default `httpx` client because of its distinctive TLS fingerprint, regardless of User-Agent. Cloudflare Bot Management and similar filters key on the JA3/TLS handshake, not on headers, so `html.duckduckgo.com` may answer `httpx` with an empty **HTTP 202** page (silently yielding "no results"). An opt-in backend, `curl` (implemented via `curl_cffi`), impersonates a real Chrome browser's TLS handshake and passes through those checks.

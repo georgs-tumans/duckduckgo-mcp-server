@@ -1786,7 +1786,6 @@ print(f"  Max content bytes: {MAX_CONTENT_BYTES or 'unlimited'}", file=sys.stder
 print(f"  Parse mode: {PARSE_MODE}", file=sys.stderr)
 print(f"  Untrusted-content envelope: {'on' if CONTENT_ENVELOPE else 'off'}", file=sys.stderr)
 print(f"  Fetch URL policy: {URL_POLICY} (max URL length {MAX_URL_LENGTH or 'unlimited'})", file=sys.stderr)
-print(f"  Untrusted-content envelope: {'on' if CONTENT_ENVELOPE else 'off'}", file=sys.stderr)
 print(f"  Long URL shortening: {'off' if not REF_URL_THRESHOLD else f'>{REF_URL_THRESHOLD} chars -> ref:// tokens'}", file=sys.stderr)
 if SSL_VERIFY is not True:
     print(f"  SSL verify: {SSL_VERIFY}", file=sys.stderr)

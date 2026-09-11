@@ -1,0 +1,31 @@
+{
+  "_comment": "Example MCP client config running this server in a hardened Podman container. Copy the ddg-search entry into your client's own config (LM Studio mcp.json, Claude Desktop claude_desktop_config.json, or a project .mcp.json). Named example.mcp.json rather than .mcp.json so it is not auto-loaded as a project config. Swap `podman` for `docker` if that is what you run. See the README section 'Running in a container'.",
+
+  "mcpServers": {
+    "ddg-search": {
+      "command": "podman",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+
+        "--read-only",
+        "--tmpfs", "/tmp",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--user", "1000:1000",
+        "--memory=512m",
+        "--pids-limit=128",
+
+        "-e", "DDG_SAFE_SEARCH=MODERATE",
+        "-e", "DDG_PARSE_MODE=markdown",
+        "-e", "DDG_CONTENT_ENVELOPE=on",
+        "-e", "DDG_MAX_CONTENT_BYTES=5000000",
+        "-e", "DDG_MAX_URL_LENGTH=2048",
+        "-e", "DDG_FETCH_HOST_RPM=6",
+
+        "ghcr.io/georgs-tumans/duckduckgo-mcp-server:latest"
+      ]
+    }
+  }
+}
