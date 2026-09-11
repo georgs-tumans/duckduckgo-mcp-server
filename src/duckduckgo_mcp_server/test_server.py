@@ -2082,6 +2082,8 @@ class TestMainCliArgs(unittest.TestCase):
             "--transport", "streamable-http",
             "--host", "0.0.0.0",
             "--port", "7070",
+            # A non-loopback bind now requires explicit Host/Origin validation.
+            "--allowed-hosts", "ddg.example.com",
         ]
         with patch.object(sys, "argv", argv), \
              patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
@@ -2096,6 +2098,72 @@ class TestMainCliArgs(unittest.TestCase):
             call_kwargs = mock_uvicorn_run.call_args.kwargs
             self.assertEqual(call_kwargs["host"], "0.0.0.0")
             self.assertEqual(call_kwargs["port"], 7070)
+
+    def _run_main(self, argv):
+        with patch.object(sys, "argv", argv), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+             patch("uvicorn.run") as mock_uvicorn_run:
+            _setup_mock_mcp_for_http(mock_mcp)
+            duckduckgo_mcp_server.server.main()
+            return mock_mcp, mock_uvicorn_run
+
+    def test_non_loopback_bind_without_allowlist_refuses_to_start(self):
+        # Regression guard: this exact invocation used to start with no Host or
+        # Origin validation at all, because the SDK only auto-enables its
+        # protection for loopback binds.
+        argv = ["duckduckgo-mcp-server", "--transport", "streamable-http", "--host", "0.0.0.0"]
+        with self.assertRaises(SystemExit):
+            self._run_main(argv)
+
+    def test_non_loopback_bind_is_allowed_with_an_allowlist(self):
+        for extra in (
+            ["--allowed-hosts", "ddg.example.com"],
+            ["--allowed-origins", "https://ddg.example.com"],
+            ["--disable-dns-rebinding-protection"],
+        ):
+            with self.subTest(extra=extra[0]):
+                argv = [
+                    "duckduckgo-mcp-server", "--transport", "streamable-http",
+                    "--host", "0.0.0.0",
+                ] + extra
+                _mcp, uvicorn_run = self._run_main(argv)
+                uvicorn_run.assert_called_once()
+
+    def test_loopback_bind_needs_no_allowlist(self):
+        for host in ("127.0.0.1", "localhost", "::1"):
+            with self.subTest(host=host):
+                argv = [
+                    "duckduckgo-mcp-server", "--transport", "streamable-http",
+                    "--host", host,
+                ]
+                _mcp, uvicorn_run = self._run_main(argv)
+                uvicorn_run.assert_called_once()
+
+    def test_cors_is_not_wildcarded(self):
+        argv = [
+            "duckduckgo-mcp-server", "--transport", "streamable-http",
+            "--host", "0.0.0.0", "--allowed-origins", "https://ddg.example.com",
+        ]
+        with patch.object(sys, "argv", argv), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+             patch("uvicorn.run"), \
+             patch("starlette.applications.Starlette.add_middleware") as add_mw:
+            _setup_mock_mcp_for_http(mock_mcp)
+            duckduckgo_mcp_server.server.main()
+        self.assertEqual(add_mw.call_count, 1)
+        self.assertEqual(
+            add_mw.call_args.kwargs["allow_origins"], ["https://ddg.example.com"]
+        )
+
+    def test_cors_omitted_when_no_origins_configured(self):
+        argv = ["duckduckgo-mcp-server", "--transport", "streamable-http"]
+        with patch.object(sys, "argv", argv), \
+             patch("duckduckgo_mcp_server.server.mcp") as mock_mcp, \
+             patch("uvicorn.run"), \
+             patch("starlette.applications.Starlette.add_middleware") as add_mw:
+            _setup_mock_mcp_for_http(mock_mcp)
+            duckduckgo_mcp_server.server.main()
+        add_mw.assert_not_called()
 
     def test_main_route_dedup_prevents_duplicates(self):
         argv = ["duckduckgo-mcp-server", "--transport", "sse", "streamable-http"]

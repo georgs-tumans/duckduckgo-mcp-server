@@ -1595,6 +1595,10 @@ mcp = MCPServer("ddg-search")
 SSE_PATH = "/sse"
 STREAMABLE_HTTP_PATH = "/mcp"
 
+# Bind addresses for which the MCP SDK auto-enables DNS-rebinding protection.
+# For any other bind it leaves the protection OFF unless we pass settings in.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
 def _env_flag(name: str) -> bool:
     """True when the named env var is set to a truthy string (1/true/yes/on)."""
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
@@ -1639,10 +1643,17 @@ def _resolve_ssl_verify(ca_certs: str, verify_enabled: bool = True):
 def _build_transport_security(allowed_hosts, allowed_origins, disable):
     """Build TransportSecuritySettings for HTTP transports, or None to keep defaults.
 
-    Returns None when nothing is configured (so the SDK's secure localhost default is
-    preserved). When an allow-list is given, DNS rebinding protection stays on but the
-    supplied Host/Origin values are permitted — the fix for 421 Misdirected Request
-    behind a reverse proxy / in Docker (issue #45). `disable` turns the protection off
+    Returns None when nothing is configured. Note what that means: the SDK only
+    auto-enables DNS-rebinding protection when the bind address is loopback
+    (127.0.0.1 / localhost / ::1). For any other bind, passing None leaves
+    TransportSecurityMiddleware at its own default of
+    enable_dns_rebinding_protection=False — i.e. no Host or Origin validation at
+    all. main() therefore refuses to start on a non-loopback bind unless an
+    allow-list (or an explicit disable) is supplied.
+
+    When an allow-list is given, DNS rebinding protection stays on but the supplied
+    Host/Origin values are permitted — the fix for 421 Misdirected Request behind a
+    reverse proxy / in Docker (issue #45). `disable` turns the protection off
     entirely (less safe; prefer an allow-list).
     """
     if not (allowed_hosts or allowed_origins or disable):
@@ -2228,6 +2239,22 @@ def main():
         allowed_hosts = args.allowed_hosts if args.allowed_hosts is not None else ALLOWED_HOSTS
         allowed_origins = args.allowed_origins if args.allowed_origins is not None else ALLOWED_ORIGINS
         disable_dns = args.disable_dns_rebinding_protection or DISABLE_DNS_REBINDING
+
+        # Fail closed. On a non-loopback bind the SDK does NOT apply its localhost
+        # default, so starting with no allow-list means no Host/Origin validation
+        # at all — any site the user visits could drive this server. Verified:
+        # --host 0.0.0.0 accepted a forged "Host: evil.com" (HTTP 200) where
+        # --host 127.0.0.1 rejected it (421).
+        if host not in LOOPBACK_HOSTS and not (allowed_hosts or allowed_origins or disable_dns):
+            parser.error(
+                f"refusing to bind {host} without Host/Origin validation: on a "
+                "non-loopback address the MCP SDK leaves DNS-rebinding protection "
+                "off unless it is configured. Pass --allowed-hosts (and usually "
+                "--allowed-origins) with the values your clients actually send, "
+                "e.g. --allowed-hosts ddg-mcp.example.com 'ddg-mcp.example.com:*'. "
+                "To accept the risk anyway, pass --disable-dns-rebinding-protection."
+            )
+
         transport_security = _build_transport_security(allowed_hosts, allowed_origins, disable_dns)
         if transport_security is not None:
             print(
@@ -2288,14 +2315,24 @@ def main():
 
         app = Starlette(routes=combined_routes, lifespan=lifespan)
 
-        # Add CORS middleware for browser-based MCP clients
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-            expose_headers=["Mcp-Session-Id"],
-        )
+        # CORS for browser-based MCP clients, scoped to the origins actually
+        # configured. A wildcard here would let any page the user visits read this
+        # server's responses, which combined with no authentication makes the
+        # whole tool set reachable from a hostile site. No configured origins
+        # means no cross-origin access is intended, so the middleware is omitted.
+        if allowed_origins:
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=list(allowed_origins),
+                allow_methods=["*"],
+                allow_headers=["*"],
+                expose_headers=["Mcp-Session-Id"],
+            )
+            print(f"  CORS allowed origins: {list(allowed_origins)}", file=sys.stderr)
+        else:
+            print(
+                "  CORS: disabled (no --allowed-origins configured)", file=sys.stderr
+            )
 
         print(
             f"Starting DuckDuckGo MCP Server with {' and '.join(transports)} transport"

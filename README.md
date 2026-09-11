@@ -111,15 +111,22 @@ uvx duckduckgo-mcp-server --transport streamable-http
 
 The default transport is `stdio`, which is used by Claude Desktop and Claude Code.
 
-When running with `sse` or `streamable-http`, override the default bind address (`127.0.0.1:8000`) with the `--host` and `--port` flags:
+When running with `sse` or `streamable-http`, override the default bind address (`127.0.0.1:8000`) with the `--host` and `--port` flags.
+
+Binding to anything other than loopback **requires** an explicit `Host`/`Origin` allow-list — the server refuses to start otherwise. See [Running behind a reverse proxy or in Docker](#running-behind-a-reverse-proxy-or-in-docker) for why:
 
 ```bash
-uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
+uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070 \
+  --allowed-hosts ddg-mcp.example.com "ddg-mcp.example.com:*"
 ```
+
+> **These transports have no authentication.** Anyone who can reach the port can run searches and fetch pages through this server. Bind to loopback unless you have put authentication in front of it.
 
 #### Running behind a reverse proxy or in Docker
 
-The MCP SDK enables DNS-rebinding protection for the HTTP transports and, by default, only accepts `Host`/`Origin` headers for `localhost`. Behind a reverse proxy or in a container the client's `Host` header won't match, so requests fail with **`421 Misdirected Request`**.
+The MCP SDK auto-enables DNS-rebinding protection **only when the bind address is loopback** (`127.0.0.1`, `localhost`, `::1`), accepting `Host`/`Origin` headers for localhost. Behind a reverse proxy or in a container the client's `Host` header won't match, so requests fail with **`421 Misdirected Request`**.
+
+For any other bind address the SDK applies *no* Host or Origin validation at all unless it is configured. That is why this server refuses to start on a non-loopback address without an allow-list — otherwise any website the user visits could drive the server over CORS.
 
 Fix it by allow-listing the host(s) and origin(s) clients actually use (preferred over disabling protection). Values support `host`, `host:port`, and wildcard-port `host:*`:
 
@@ -131,7 +138,11 @@ uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
 
 Equivalent environment variables (comma-separated) are also available: `DDG_ALLOWED_HOSTS`, `DDG_ALLOWED_ORIGINS`.
 
-As a last resort you can turn the check off entirely with `--disable-dns-rebinding-protection` (or `DDG_DISABLE_DNS_REBINDING_PROTECTION=1`). Prefer an allow-list — disabling protection removes a defense against DNS-rebinding attacks. When nothing is configured, the secure localhost-only default is preserved.
+As a last resort you can turn the check off entirely with `--disable-dns-rebinding-protection` (or `DDG_DISABLE_DNS_REBINDING_PROTECTION=1`). Prefer an allow-list — disabling protection removes a defense against DNS-rebinding attacks.
+
+On a loopback bind with nothing configured, the SDK's localhost-only default applies and no allow-list is needed. On any other bind you must pass an allow-list or explicitly disable the check; the server will not start silently unprotected.
+
+CORS is scoped to `--allowed-origins`. When no origins are configured the CORS middleware is not installed at all, so browser pages cannot read this server's responses.
 
 #### Running behind a TLS-intercepting proxy
 
