@@ -1,6 +1,6 @@
 from mcp.server.mcpserver import MCPServer, Context
 import httpx
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Comment
 from typing import List, Optional
 from dataclasses import dataclass
 from collections import OrderedDict
@@ -553,7 +553,9 @@ class DuckDuckGoSearcher:
                 if not link_elem:
                     continue
 
-                title = link_elem.get_text(strip=True)
+                # Titles and snippets are attacker-influenced too, so they get the
+                # same invisible-character treatment as fetched page text.
+                title = _strip_invisible_chars(link_elem.get_text(strip=True))
                 link = link_elem.get("href", "")
 
                 # Skip ad results
@@ -565,7 +567,11 @@ class DuckDuckGoSearcher:
                     link = urllib.parse.unquote(link.split("uddg=")[1].split("&")[0])
 
                 snippet_elem = result.select_one(".result__snippet")
-                snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+                snippet = (
+                    _strip_invisible_chars(snippet_elem.get_text(strip=True))
+                    if snippet_elem
+                    else ""
+                )
 
                 results.append(
                     SearchResult(
@@ -882,6 +888,74 @@ def _strip_chrome(soup: BeautifulSoup, tags=None) -> BeautifulSoup:
     return soup
 
 
+# Inline styles that hide an element from a human reader while leaving its text
+# in the extracted output — the cheapest way to smuggle instructions into a page
+# that looks innocuous when opened in a browser.
+_HIDDEN_STYLE_PATTERN = re.compile(
+    r"display\s*:\s*none"
+    r"|visibility\s*:\s*hidden"
+    r"|opacity\s*:\s*0(?!\s*\.\s*[1-9])"
+    r"|font-size\s*:\s*0"
+    r"|(?:left|top|text-indent)\s*:\s*-\s*\d{3,}"
+    ,
+    re.IGNORECASE,
+)
+
+# Tags whose content is never shown as page text.
+_HIDDEN_TAGS = ("template", "noscript")
+
+# Zero-width, joiner, and bidirectional-control characters. They render as
+# nothing (or reorder what follows) but survive text extraction, so they can
+# hide text from anyone eyeballing the output.
+_INVISIBLE_CHARS = re.compile(
+    "["
+    "\u00ad"          # soft hyphen
+    "\u200b-\u200f"  # zero-width space/joiners, LTR/RTL marks
+    "\u202a-\u202e"  # bidi embedding/override
+    "\u2060-\u2064"  # word joiner, invisible operators
+    "\u2066-\u2069"  # bidi isolates
+    "\ufeff"          # zero-width no-break space / BOM
+    "]"
+)
+
+
+def _strip_invisible_chars(text: str) -> str:
+    """Drop characters that occupy no visible space in extracted text."""
+    return _INVISIBLE_CHARS.sub("", text or "")
+
+
+def _strip_hidden(soup: BeautifulSoup) -> BeautifulSoup:
+    """Remove page content a human reader would never see.
+
+    Covers HTML comments, ``<template>``/``<noscript>``, ``hidden`` and
+    ``aria-hidden`` elements, and elements whose *inline* style hides them.
+
+    Limitation worth knowing: only the ``style`` attribute is inspected. Text
+    hidden by an external stylesheet or a ``<style>`` block (true white-on-white)
+    is not detected — that needs full CSS cascade resolution, which is out of
+    scope here.
+    """
+    for comment in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        comment.extract()
+
+    for element in soup(list(_HIDDEN_TAGS)):
+        if not getattr(element, "decomposed", False):
+            element.decompose()
+
+    for element in soup.select("[hidden], [aria-hidden='true']"):
+        # A parent may already have been removed on an earlier pass.
+        if not getattr(element, "decomposed", False):
+            element.decompose()
+
+    for element in soup.find_all(style=True):
+        if getattr(element, "decomposed", False):
+            continue
+        if _HIDDEN_STYLE_PATTERN.search(element.get("style") or ""):
+            element.decompose()
+
+    return soup
+
+
 def _select_main_root(soup: BeautifulSoup):
     """Return the primary content node, or the soup itself if none is obvious."""
     for selector in _MAIN_SELECTORS:
@@ -994,14 +1068,18 @@ def _html_to_text(html: str, mode: str = "text") -> str:
     if mode not in SUPPORTED_PARSE_MODES:
         raise ValueError(f"Unknown parse mode '{mode}'. Supported: {SUPPORTED_PARSE_MODES}")
     soup = BeautifulSoup(html, "html.parser")
+    # Applied in every mode. `text` previously stripped only script/style/nav/
+    # header/footer, leaving the cheapest smuggling vectors (display:none blocks,
+    # HTML comments) fully intact in the text handed to the model.
+    _strip_hidden(soup)
     if mode == "text":
         _strip_chrome(soup, _TEXT_CHROME_TAGS)
-        return _collapse_whitespace(soup.get_text())
+        return _strip_invisible_chars(_collapse_whitespace(soup.get_text()))
     _strip_chrome(soup, _MAIN_CHROME_TAGS)
     root = _select_main_root(soup)
     if mode == "main":
-        return _collapse_whitespace(root.get_text())
-    return _html_to_markdown(root)
+        return _strip_invisible_chars(_collapse_whitespace(root.get_text()))
+    return _strip_invisible_chars(_html_to_markdown(root))
 
 
 class WebContentFetcher:
