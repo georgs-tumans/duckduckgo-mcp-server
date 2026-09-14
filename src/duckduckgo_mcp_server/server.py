@@ -332,7 +332,11 @@ def _entry_size(value) -> int:
     by the entry-count cap alone — the budget exists to bound large page text,
     not to be a general-purpose accountant.
     """
-    if isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, str):
+        # Encoded length, not code points: the budget is a byte budget, and a
+        # page of multibyte characters would otherwise consume several times it.
+        return len(value.encode("utf-8", errors="ignore"))
+    if isinstance(value, (bytes, bytearray)):
         return len(value)
     if isinstance(value, tuple):
         return sum(_entry_size(item) for item in value)
@@ -463,6 +467,23 @@ def _curl_cffi_available() -> bool:
     except ImportError:
         return False
     return True
+
+
+def _require_curl_streaming(session_cls) -> None:
+    """Fail clearly if the installed curl_cffi cannot stream.
+
+    Both curl paths rely on ``AsyncSession.stream()`` + ``Response.aiter_content()``
+    to enforce the response byte ceiling. The [browser] extra pins the version that
+    was verified to provide them; a force-installed older release would otherwise
+    blow up with an obscure AttributeError part-way through a request, so turn it
+    into something actionable instead.
+    """
+    if not hasattr(session_cls, "stream"):
+        raise RuntimeError(
+            "The installed curl_cffi is too old: AsyncSession.stream() is missing, "
+            "and this server needs it to bound response size. Upgrade with: "
+            "pip install -U 'duckduckgo-mcp-server[browser]' (needs curl_cffi>=0.15.0)."
+        )
 
 
 class DuckDuckGoSearcher:
@@ -735,19 +756,27 @@ class DuckDuckGoSearcher:
         ``raise_for_status()`` does not fire — the caller inspects the status.
         """
         async with httpx.AsyncClient(verify=self.ssl_verify) as client:
-            response = await client.post(
-                self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
-            )
-            if response.status_code == 429:
-                await _sleep_retry_after(response.headers)
-                response = await client.post(
-                    self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
-                )
-            response.raise_for_status()
-            # Bound the result page too. No content-type check here: the only
-            # target is DuckDuckGo's own HTML endpoint, and refusing an
-            # unexpected type would break search rather than protect anything.
-            return response.status_code, _cap_text(response.text, self.max_content_bytes)
+            # Streamed, not client.post(): a buffered POST would materialise the
+            # whole body before any cap could apply, so max_content_bytes would
+            # not actually bound memory on the search path.
+            # No content-type check here: the only target is DuckDuckGo's own
+            # HTML endpoint, and refusing an unexpected type would break search
+            # rather than protect anything.
+            for attempt in range(2):
+                async with client.stream(
+                    "POST", self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
+                ) as response:
+                    if response.status_code == 429 and attempt == 0:
+                        await _sleep_retry_after(response.headers)
+                        continue
+                    response.raise_for_status()
+                    body = await _read_capped_stream(
+                        response.aiter_bytes(),
+                        response.charset_encoding,
+                        self.max_content_bytes,
+                    )
+                    return response.status_code, body
+            raise httpx.HTTPError(f"rate limited by {self.BASE_URL} after a retry")
 
     async def _request_curl(self, data: dict) -> str:
         """POST the search form via curl_cffi with Chrome 131 TLS impersonation."""
@@ -760,13 +789,25 @@ class DuckDuckGoSearcher:
             ) from e
         # Let curl_cffi supply the impersonated browser headers for a consistent
         # Chrome fingerprint; we only send the search form fields.
+        _require_curl_streaming(AsyncSession)
         async with AsyncSession(impersonate="chrome131", verify=self.ssl_verify) as client:
-            response = await client.post(self.BASE_URL, data=data, timeout=30.0)
-            if getattr(response, "status_code", None) == 429:
-                await _sleep_retry_after(getattr(response, "headers", None))
-                response = await client.post(self.BASE_URL, data=data, timeout=30.0)
-            response.raise_for_status()
-            return _cap_text(response.text, self.max_content_bytes)
+            # Streamed for the same reason as the httpx path: a buffered POST
+            # would defeat max_content_bytes, and the ceiling must not depend on
+            # which backend served the request.
+            for attempt in range(2):
+                async with client.stream(
+                    "POST", self.BASE_URL, data=data, timeout=30.0
+                ) as response:
+                    if getattr(response, "status_code", None) == 429 and attempt == 0:
+                        await _sleep_retry_after(getattr(response, "headers", None))
+                        continue
+                    response.raise_for_status()
+                    return await _read_capped_stream(
+                        response.aiter_content(),
+                        getattr(response, "encoding", None),
+                        self.max_content_bytes,
+                    )
+            raise httpx.HTTPError(f"rate limited by {self.BASE_URL} after a retry")
 
 
 # Cloudflare / bot-filter challenge signals that appear in response bodies even
@@ -855,6 +896,35 @@ def _declared_too_large(headers, limit: int) -> Optional[int]:
     except ValueError:
         return None
     return size if size > limit else None
+
+
+async def _read_capped_stream(chunks, encoding: Optional[str], limit: int) -> FetchedText:
+    """Consume an async byte-chunk iterator up to ``limit`` bytes, then decode.
+
+    Stops pulling chunks once the cap is reached rather than buffering the whole
+    body, so an oversized or endless response costs bounded memory. Shared by the
+    searcher and the fetcher, on both backends, so the ceiling cannot behave
+    differently depending on which path a request took.
+
+    The comparison is strictly greater-than: a body whose length is *exactly* the
+    limit is complete, not truncated, and must not be reported (or cached) as cut
+    short. Truncation is only recorded once bytes are actually dropped.
+    """
+    buffer = bytearray()
+    truncated = False
+    async for chunk in chunks:
+        if limit and len(buffer) + len(chunk) > limit:
+            buffer.extend(chunk[: max(0, limit - len(buffer))])
+            truncated = True
+            break
+        buffer.extend(chunk)
+    try:
+        text = bytes(buffer).decode(encoding or "utf-8", errors="replace")
+    except LookupError:
+        # Server named a charset Python doesn't know; utf-8 with replacement
+        # still yields usable text rather than failing the whole fetch.
+        text = bytes(buffer).decode("utf-8", errors="replace")
+    return FetchedText(text, truncated=truncated)
 
 
 def _cap_text(text: str, limit: int) -> FetchedText:
@@ -1293,28 +1363,8 @@ class WebContentFetcher:
             )
 
     async def _decode_capped(self, chunks, encoding: Optional[str]) -> FetchedText:
-        """Consume an async byte-chunk iterator up to the ceiling, then decode.
-
-        Stops pulling chunks once the cap is reached rather than buffering the
-        whole body, so an oversized or endless response costs bounded memory.
-        Shared by both backends so their limits can't drift apart.
-        """
-        limit = self.max_content_bytes
-        buffer = bytearray()
-        truncated = False
-        async for chunk in chunks:
-            if limit and len(buffer) + len(chunk) >= limit:
-                buffer.extend(chunk[: max(0, limit - len(buffer))])
-                truncated = True
-                break
-            buffer.extend(chunk)
-        try:
-            text = bytes(buffer).decode(encoding or "utf-8", errors="replace")
-        except LookupError:
-            # Server named a charset Python doesn't know; utf-8 with replacement
-            # still yields usable text rather than failing the whole fetch.
-            text = bytes(buffer).decode("utf-8", errors="replace")
-        return FetchedText(text, truncated=truncated)
+        """Consume an async byte-chunk iterator up to this fetcher's ceiling."""
+        return await _read_capped_stream(chunks, encoding, self.max_content_bytes)
 
     async def _read_capped(self, response) -> FetchedText:
         """Read a streamed httpx response up to the byte ceiling."""
@@ -1372,6 +1422,7 @@ class WebContentFetcher:
                 "The 'curl' fetch backend requires curl_cffi, which is not installed. "
                 "Install the optional extra: pip install 'duckduckgo-mcp-server[browser]'"
             ) from e
+        _require_curl_streaming(AsyncSession)
         async with AsyncSession(impersonate="chrome131", verify=self.ssl_verify) as client:
             current = url
             for _ in range(_MAX_REDIRECTS + 1):
@@ -1509,7 +1560,9 @@ class WebContentFetcher:
                 text = _html_to_text(html, effective_mode)
                 if cache_key is not None:
                     self.cache.set(
-                        cache_key, (text, transport_truncated), size=len(text)
+                        cache_key,
+                        (text, transport_truncated),
+                        size=len(text.encode("utf-8", errors="ignore")),
                     )
             else:
                 await ctx.info(
@@ -1638,6 +1691,31 @@ def _resolve_ssl_verify(ca_certs: str, verify_enabled: bool = True):
     if ca_certs:
         return ca_certs
     return True
+
+
+def _cors_origin_settings(allowed_origins):
+    """Split Host-style origin patterns into CORS ``(allow_origins, regex)``.
+
+    ``TransportSecuritySettings`` accepts wildcard-port values like
+    ``https://example.com:*``, but Starlette's CORSMiddleware matches
+    ``allow_origins`` literally (only a bare ``*`` is special). Passing the
+    wildcard form straight through would validate the Host header while silently
+    sending no CORS headers to ``https://example.com:3000`` — the two checks
+    would disagree. Wildcard-port entries therefore become an origin regex.
+
+    Note the wildcard requires an explicit port, matching how
+    TransportSecuritySettings treats ``host:*`` — ``https://example.com`` with no
+    port is not covered by ``https://example.com:*``. List it separately if you
+    need both.
+    """
+    exact, patterns = [], []
+    for origin in allowed_origins or []:
+        if origin.endswith(":*"):
+            patterns.append(re.escape(origin[:-2]) + r":\d+")
+        else:
+            exact.append(origin)
+    regex = "|".join(f"^{p}$" for p in patterns) if patterns else None
+    return exact, regex
 
 
 def _build_transport_security(allowed_hosts, allowed_origins, disable):
@@ -1951,7 +2029,7 @@ def main():
         metavar="N",
         help=(
             "Optional per-host fetch_content cap so one site cannot use the whole "
-            "fetch budget (default: 0, off; or DDG_FETCH_HOST_RPM)."
+            "fetch budget (default: 6; `0` disables it. Or DDG_FETCH_HOST_RPM)."
         ),
     )
     parser.add_argument(
@@ -2005,9 +2083,10 @@ def main():
         help=(
             "Which URLs fetch_content accepts. 'any' (default) allows any public "
             "http(s) URL. 'tokens' accepts only ref:// tokens this server minted "
-            "from its own search results, which removes the model's ability to "
-            "encode data into an outbound request — at the cost of not being able "
-            "to follow links found inside a page or fetch a URL the user pasted. "
+            "from its own search results, so the model cannot encode data into a "
+            "fetch_content URL — at the cost of not being able to follow links found "
+            "inside a page or fetch a URL the user pasted. Note this covers fetch "
+            "URLs only; the search query is still a free-form outbound field. "
             "Also DDG_FETCH_URL_POLICY."
         ),
     )
@@ -2331,14 +2410,20 @@ def main():
         # whole tool set reachable from a hostile site. No configured origins
         # means no cross-origin access is intended, so the middleware is omitted.
         if allowed_origins:
+            cors_origins, cors_origin_regex = _cors_origin_settings(allowed_origins)
             app.add_middleware(
                 CORSMiddleware,
-                allow_origins=list(allowed_origins),
+                allow_origins=cors_origins,
+                allow_origin_regex=cors_origin_regex,
                 allow_methods=["*"],
                 allow_headers=["*"],
                 expose_headers=["Mcp-Session-Id"],
             )
-            print(f"  CORS allowed origins: {list(allowed_origins)}", file=sys.stderr)
+            print(
+                f"  CORS allowed origins: {cors_origins or '[]'}"
+                + (f" regex={cors_origin_regex}" if cors_origin_regex else ""),
+                file=sys.stderr,
+            )
         else:
             print(
                 "  CORS: disabled (no --allowed-origins configured)", file=sys.stderr

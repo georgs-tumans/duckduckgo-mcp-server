@@ -14,6 +14,44 @@ import duckduckgo_mcp_server.server as ddg_server
 from duckduckgo_mcp_server.server import mcp as mcp_app
 
 
+class _FakeStream:
+    """Async context manager standing in for ``client.stream(...)``."""
+
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def _stream_client(html, status_code=200):
+    """httpx client double serving ``html`` through the streaming API.
+
+    The search path streams its POST so the response byte ceiling actually
+    bounds memory, so a doubled client has to offer .stream() rather than .post().
+    """
+    resp = MagicMock(spec=httpx.Response)
+    resp.text = html
+    resp.status_code = status_code
+    resp.headers = {}
+    resp.charset_encoding = "utf-8"
+    resp.raise_for_status = MagicMock()
+
+    async def _aiter(*args, **kwargs):
+        yield html.encode("utf-8")
+
+    resp.aiter_bytes = _aiter
+
+    client = AsyncMock()
+    client.stream = MagicMock(side_effect=lambda *a, **k: _FakeStream(resp))
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
 @pytest.fixture
 def allow_private_fetches():
     """Let fetch_content reach the local test server (127.0.0.1) despite the SSRF guard.
@@ -116,15 +154,7 @@ async def test_search_tool_e2e(ddg_html_factory):
         {"title": "E2E Result", "href": "https://e2e.example.com", "snippet": "An e2e snippet"},
     ])
 
-    mock_resp = MagicMock(spec=httpx.Response)
-    mock_resp.text = html
-    mock_resp.status_code = 200
-    mock_resp.raise_for_status = MagicMock()
-
-    mock_client = AsyncMock()
-    mock_client.post = AsyncMock(return_value=mock_resp)
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client = _stream_client(html)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
         async with Client(mcp_app) as client:

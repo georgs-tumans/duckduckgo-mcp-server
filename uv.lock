@@ -325,7 +325,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.13.3" },
-    { name = "curl-cffi", marker = "extra == 'browser'", specifier = ">=0.7.0" },
+    { name = "curl-cffi", marker = "extra == 'browser'", specifier = ">=0.15.0" },
     { name = "httpcore", specifier = ">=1.0.8" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "mcp", extras = ["cli"], specifier = ">=2.1.1,<3" },

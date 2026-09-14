@@ -47,6 +47,10 @@ from duckduckgo_mcp_server.server import (
     _neutralize_envelope_markers,
     SUPPORTED_URL_POLICIES,
     DEFAULT_MAX_URL_LENGTH,
+    _read_capped_stream,
+    _entry_size,
+    _cors_origin_settings,
+    _require_curl_streaming,
     FetchRejectedError,
     FetchedText,
     _cap_text,
@@ -197,10 +201,7 @@ class TestTokenBucketAndHostLimits(unittest.TestCase):
         ok.text = html
         ok.raise_for_status = MagicMock()
 
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=[blocked, ok])
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _stream_client(blocked, ok)
 
         with patch("httpx.AsyncClient", return_value=mock_client), \
              patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
@@ -208,7 +209,7 @@ class TestTokenBucketAndHostLimits(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(body, html)
-        self.assertEqual(mock_client.post.call_count, 2)
+        self.assertEqual(mock_client.stream.call_count, 2)
         mock_sleep.assert_called_once()
 
     def test_main_parses_rate_limit_flags(self):
@@ -506,10 +507,7 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         ctx = DummyCtx()
 
         mock_resp = _mock_post_response(html)
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _stream_client(mock_resp)
 
         with patch("httpx.AsyncClient", return_value=mock_client):
             results = asyncio.run(searcher.search("test query", ctx, max_results, region))
@@ -571,10 +569,7 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         searcher = DuckDuckGoSearcher()
         ctx = DummyCtx()
 
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _stream_client(side_effect=httpx.TimeoutException("timeout"))
 
         with patch("httpx.AsyncClient", return_value=mock_client):
             results = asyncio.run(searcher.search("test", ctx))
@@ -589,11 +584,8 @@ class TestDuckDuckGoSearcherParsing(unittest.TestCase):
         mock_resp.request = MagicMock()
         error = httpx.HTTPStatusError("error", request=mock_resp.request, response=mock_resp)
 
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
         mock_resp.raise_for_status = MagicMock(side_effect=error)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _stream_client(mock_resp)
 
         with patch("httpx.AsyncClient", return_value=mock_client):
             results = asyncio.run(searcher.search("test", ctx))
@@ -1145,6 +1137,31 @@ def _as_stream_response(resp):
     return resp
 
 
+def _stream_client(*responses, side_effect=None):
+    """Client double whose .stream() yields the given responses in order.
+
+    The search path streams its POST (a buffered post() would materialise the
+    whole body before any byte cap could apply), so its test doubles present the
+    streaming shape rather than an awaited .post().
+    """
+    prepared = [_as_stream_response(r) for r in responses]
+    remaining = iter(prepared)
+
+    def _make(*args, **kwargs):
+        if side_effect is not None:
+            return _FakeStream(side_effect=side_effect)
+        try:
+            return _FakeStream(response=next(remaining))
+        except StopIteration:
+            return _FakeStream(response=prepared[-1])
+
+    client = AsyncMock()
+    client.stream = MagicMock(side_effect=_make)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
 def _patch_backend_client(backend, *, get_return_value=None, get_side_effect=None):
     """Return a context manager that patches the HTTP client for the given backend.
 
@@ -1330,6 +1347,115 @@ class TestUrlLengthCap(unittest.TestCase):
             self.assertIn("normal", asyncio.run(fetcher.fetch_and_parse(url, DummyCtx())))
         finally:
             stop()
+
+
+async def _achunks(*chunks):
+    for chunk in chunks:
+        yield chunk
+
+
+class TestCapAccounting(unittest.TestCase):
+    """Regressions from review: the ceiling must be exact, byte-based, and
+    applied on every path rather than only on fetch_content."""
+
+    def test_body_exactly_at_the_limit_is_not_truncated(self):
+        body = b"A" * 100
+        out = asyncio.run(_read_capped_stream(_achunks(body), "utf-8", 100))
+        self.assertEqual(len(out), 100)
+        self.assertFalse(out.truncated, "a complete body must not be flagged truncated")
+
+    def test_body_one_byte_over_is_truncated(self):
+        out = asyncio.run(_read_capped_stream(_achunks(b"A" * 101), "utf-8", 100))
+        self.assertEqual(len(out), 100)
+        self.assertTrue(out.truncated)
+
+    def test_chunks_summing_exactly_to_the_limit_are_not_truncated(self):
+        out = asyncio.run(_read_capped_stream(_achunks(b"A" * 50, b"B" * 50), "utf-8", 100))
+        self.assertEqual(len(out), 100)
+        self.assertFalse(out.truncated)
+
+    def test_zero_limit_reads_everything(self):
+        out = asyncio.run(_read_capped_stream(_achunks(b"A" * 5000), "utf-8", 0))
+        self.assertEqual(len(out), 5000)
+        self.assertFalse(out.truncated)
+
+    def test_search_response_is_bounded(self):
+        # The search POST is streamed; a buffered post() would materialise the
+        # whole body before any cap could apply.
+        huge = "<html><body>" + "Z" * 100_000 + "</body></html>"
+        searcher = DuckDuckGoSearcher(max_content_bytes=2000)
+        mock_client = _stream_client(_mock_post_response(huge))
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            status, body = asyncio.run(searcher._request_httpx({"q": "x"}))
+        self.assertEqual(status, 200)
+        self.assertLessEqual(len(body), 2000)
+        self.assertTrue(body.truncated)
+        # It really streamed rather than buffering then slicing.
+        self.assertTrue(mock_client.stream.called)
+        self.assertEqual(mock_client.stream.call_args.args[0], "POST")
+
+    def test_entry_size_counts_bytes_not_code_points(self):
+        # A budget in bytes must not be defeated by multibyte text.
+        self.assertEqual(_entry_size("abc"), 3)
+        self.assertEqual(_entry_size("日本語"), 9)  # 3 chars, 9 bytes
+        self.assertEqual(_entry_size(b"abcd"), 4)
+        self.assertEqual(_entry_size(("ab", "cd")), 4)
+        self.assertEqual(_entry_size(42), 0)
+
+    def test_cache_budget_respects_multibyte_text(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=10, max_bytes=100)
+        # 60 characters of 3-byte text = 180 bytes, over the whole budget.
+        cache.set("big", "日" * 60)
+        self.assertIsNone(cache.get("big"))
+
+
+class TestCorsOriginSettings(unittest.TestCase):
+    """TransportSecuritySettings accepts host:* wildcards; Starlette's
+    allow_origins does not, so the two must not silently disagree."""
+
+    def test_exact_origins_pass_through(self):
+        exact, regex = _cors_origin_settings(["https://a.example", "https://b.example"])
+        self.assertEqual(exact, ["https://a.example", "https://b.example"])
+        self.assertIsNone(regex)
+
+    def test_wildcard_port_becomes_a_regex(self):
+        exact, regex = _cors_origin_settings(["https://a.example", "https://b.example:*"])
+        self.assertEqual(exact, ["https://a.example"])
+        self.assertIsNotNone(regex)
+        self.assertTrue(re.match(regex, "https://b.example:3000"))
+        self.assertTrue(re.match(regex, "https://b.example:8443"))
+
+    def test_wildcard_regex_does_not_over_match(self):
+        _exact, regex = _cors_origin_settings(["https://b.example:*"])
+        for bad in (
+            "https://b.example.evil.com:3000",
+            "https://evil.com/https://b.example:3000",
+            "https://b.example:3000.evil.com",
+            "http://b.example:3000",
+        ):
+            self.assertIsNone(re.match(regex, bad), bad)
+
+    def test_empty_input(self):
+        self.assertEqual(_cors_origin_settings([]), ([], None))
+        self.assertEqual(_cors_origin_settings(None), ([], None))
+
+
+class TestCurlStreamingRequirement(unittest.TestCase):
+    def test_missing_stream_gives_an_actionable_error(self):
+        class OldSession:  # no .stream(): pre-streaming curl_cffi
+            pass
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _require_curl_streaming(OldSession)
+        self.assertIn("curl_cffi", str(ctx.exception))
+        self.assertIn("0.15.0", str(ctx.exception))
+
+    def test_modern_session_passes(self):
+        class NewSession:
+            def stream(self):  # pragma: no cover - presence is what matters
+                ...
+
+        _require_curl_streaming(NewSession)  # must not raise
 
 
 class TestUntrustedEnvelope(unittest.TestCase):
@@ -2321,10 +2447,7 @@ class TestSSLVerifyConfig(unittest.TestCase):
     def test_searcher_passes_verify_to_httpx_client(self):
         searcher = DuckDuckGoSearcher(backend="httpx", ssl_verify="/etc/proxy-ca.pem")
         mock_resp = _mock_post_response("<html><body></body></html>")
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _stream_client(mock_resp)
 
         with patch("httpx.AsyncClient", return_value=mock_client) as mock_cls:
             asyncio.run(searcher.search("test", DummyCtx()))
@@ -2389,15 +2512,12 @@ class TestConfiguration(unittest.TestCase):
         ctx = DummyCtx()
 
         mock_resp = _mock_post_response("<html><body></body></html>")
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _stream_client(mock_resp)
 
         with patch("httpx.AsyncClient", return_value=mock_client):
             asyncio.run(searcher.search("test", ctx))
 
-        call_kwargs = mock_client.post.call_args
+        call_kwargs = mock_client.stream.call_args
         post_data = call_kwargs.kwargs.get("data") or call_kwargs[1].get("data")
         self.assertEqual(post_data["kp"], "1")
 
@@ -2406,14 +2526,11 @@ class TestConfiguration(unittest.TestCase):
         ctx = DummyCtx()
 
         mock_resp = _mock_post_response("<html><body></body></html>")
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client = _stream_client(mock_resp)
 
         with patch("httpx.AsyncClient", return_value=mock_client):
             asyncio.run(searcher.search("test", ctx))
 
-        call_kwargs = mock_client.post.call_args
+        call_kwargs = mock_client.stream.call_args
         post_data = call_kwargs.kwargs.get("data") or call_kwargs[1].get("data")
         self.assertEqual(post_data["kl"], "us-en")
