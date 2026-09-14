@@ -18,6 +18,28 @@ jobs:
       - run: uv sync
       - run: uv run python -m pytest src/duckduckgo_mcp_server/ -v
 
+  # The default `uv sync` omits the optional [browser] extra, so curl_cffi is
+  # absent and every curl-backend test is skipped. Both curl paths stream
+  # responses to enforce the byte ceiling, and that code would otherwise never
+  # run against real curl_cffi in CI — an API or context-manager change could
+  # ship unnoticed.
+  test-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv python install 3.12
+      - run: uv sync --extra browser
+      - name: Tests with the curl backend enabled
+        run: uv run python -m pytest src/duckduckgo_mcp_server/ -v
+      - name: Fail if the curl tests were skipped
+        run: |
+          uv run python -m pytest src/duckduckgo_mcp_server/test_server.py \
+            -k "CurlSearchPathLive" -q --no-header \
+            | tee /tmp/curl.txt
+          grep -qE "[1-9][0-9]* passed" /tmp/curl.txt \
+            || { echo "::error::curl backend tests did not run"; exit 1; }
+
   quality:
     runs-on: ubuntu-latest
     steps:
