@@ -59,6 +59,8 @@ Three MCP tools are exposed: `search`, `fetch_content`, and `expand_link`.
 This server feeds attacker-authored text to a model, so a few invariants matter when changing it:
 
 - Anything derived from a fetched page or a search result is untrusted. Keep it inside the envelope; never emit page-derived text after the closing tag.
+- That includes **error messages**. Header values, redirect targets and HTTP client messages are remote-controlled, so they go through `_error_with_detail`, which keeps a fixed server-authored summary outside and fences the detail. Provoking a rejection would otherwise be the cheapest way out of the envelope.
+- Result hrefs pass through `_sanitize_link` before reaching the registry: `expand_link` returns a URL as bare text, so a newline in it would be an injection primitive.
 - `_guard_url` runs on every redirect hop, not just the initial URL. Keep it that way.
 - The transport byte ceiling must stay *before* parsing. `max_length` is pagination, not a limit.
 - A non-loopback HTTP bind without a Host/Origin allow-list is refused in `main()`: the MCP SDK applies its localhost default only for loopback binds and otherwise leaves DNS-rebinding protection off entirely.

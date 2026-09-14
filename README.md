@@ -123,6 +123,8 @@ uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
 
 Equivalent environment variables (comma-separated) are also available: `DDG_ALLOWED_HOSTS`, `DDG_ALLOWED_ORIGINS`.
 
+> **`--allowed-origins` on its own will not start.** The SDK validates `Host` before `Origin`, against an allow-list that would be empty - so an origins-only configuration answers `421` to *every* request, including from the origin you allow-listed. Always pass `--allowed-hosts` as well. (This applied to loopback binds too, since supplying any settings suppresses the SDK's localhost default.)
+
 As a last resort you can turn the check off entirely with `--disable-dns-rebinding-protection` (or `DDG_DISABLE_DNS_REBINDING_PROTECTION=1`). Prefer an allow-list — disabling protection removes a defense against DNS-rebinding attacks.
 
 On a loopback bind with nothing configured, the SDK's localhost-only default applies and no allow-list is needed. On any other bind you must pass an allow-list or explicitly disable the check; the server will not start silently unprotected.
@@ -336,7 +338,7 @@ These do nothing under the default `stdio` transport.
 | Environment variable | CLI flag | Default | What it does |
 | --- | --- | --- | --- |
 | `DDG_ALLOWED_HOSTS` | `--allowed-hosts` | none | Allowed `Host` values. Accepts `host`, `host:port`, `host:*`. |
-| `DDG_ALLOWED_ORIGINS` | `--allowed-origins` | none | Allowed `Origin` values. Also scopes CORS; with none set, CORS is not enabled at all. |
+| `DDG_ALLOWED_ORIGINS` | `--allowed-origins` | none | Allowed `Origin` values. **Requires `DDG_ALLOWED_HOSTS` too** (see below). Also scopes CORS; with none set, CORS is not enabled at all. Wildcard-port values are honoured for CORS as well as Host. |
 | `DDG_DISABLE_DNS_REBINDING_PROTECTION` | `--disable-dns-rebinding-protection` | off | Turn Host/Origin validation off entirely. Prefer an allow-list. |
 | - | `--host` / `--port` | `127.0.0.1` / `8000` | Bind address. **A non-loopback bind requires an allow-list or the server refuses to start** - see [Running behind a reverse proxy or in Docker](#running-behind-a-reverse-proxy-or-in-docker). |
 
