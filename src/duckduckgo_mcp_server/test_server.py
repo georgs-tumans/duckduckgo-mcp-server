@@ -1640,6 +1640,34 @@ class TestHiddenStyleClassification(unittest.TestCase):
             with self.subTest(style=style):
                 self.assertTrue(_is_hidden_style(style))
 
+    def test_priority_markers_do_not_evade_detection(self):
+        # CSS keywords are case-insensitive and "! important" is valid, so the
+        # marker has to be stripped after lower-casing, not before.
+        for style in (
+            "display:none !important",
+            "display:none !IMPORTANT",
+            "display:none ! important",
+            "DISPLAY:NONE !Important",
+            "opacity:0 !IMPORTANT",
+            "visibility:hidden !IMPORTANT",
+        ):
+            with self.subTest(style=style):
+                self.assertTrue(_is_hidden_style(style))
+
+    def test_priority_marker_does_not_make_visible_text_hidden(self):
+        for style in ("font-size:0.875rem !important", "opacity:0.5 !IMPORTANT"):
+            with self.subTest(style=style):
+                self.assertFalse(_is_hidden_style(style))
+
+    def test_uppercase_priority_marker_is_stripped_from_a_page(self):
+        html = (
+            "<html><body><p>keep</p>"
+            "<p style='display:none !IMPORTANT'>SMUGGLED</p></body></html>"
+        )
+        text = _html_to_text(html)
+        self.assertIn("keep", text)
+        self.assertNotIn("SMUGGLED", text)
+
     def test_visible_text_survives_extraction(self):
         html = (
             "<html><body><article>"
@@ -1725,6 +1753,53 @@ class TestPerHostLimitCoversRedirects(unittest.TestCase):
         finally:
             stop()
         self.assertEqual(len(seen), 1)
+
+    def test_429_retry_is_charged_separately(self):
+        # The retry is a second HTTP request to the same host. Charging only the
+        # first let a host receive up to twice the configured cap.
+        fetcher = WebContentFetcher(allow_private_urls=True, host_requests_per_minute=30)
+        charged = []
+        original = fetcher.host_limiter.acquire
+
+        async def record(url):
+            charged.append(url)
+            return await original(url)
+
+        throttled = MagicMock()
+        throttled.status_code = 429
+        throttled.headers = {"retry-after": "0"}
+        ok = _as_stream_response(
+            _mock_post_response("<html><body><p>after retry</p></body></html>")
+        )
+        responses = iter([throttled, ok])
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(
+            side_effect=lambda *a, **k: _FakeStream(response=next(responses))
+        )
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(fetcher.host_limiter, "acquire", side_effect=record), \
+             patch("httpx.AsyncClient", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = asyncio.run(
+                fetcher.fetch_and_parse("https://slow.example/p", DummyCtx())
+            )
+
+        self.assertIn("after retry", result)
+        self.assertEqual(mock_client.stream.call_count, 2, "two requests were sent")
+        self.assertEqual(len(charged), 2, "so two host-limit tokens must be taken")
+
+    def test_no_host_limiter_means_no_charging(self):
+        # host_requests_per_minute=0 disables the cap; the retry path must not
+        # blow up on a missing limiter.
+        fetcher = WebContentFetcher(allow_private_urls=True, host_requests_per_minute=0)
+        self.assertIsNone(fetcher.host_limiter)
+        url, stop = _serve_html("<html><body><p>no cap</p></body></html>")
+        try:
+            self.assertIn("no cap", asyncio.run(fetcher.fetch_and_parse(url, DummyCtx())))
+        finally:
+            stop()
 
     def test_cache_hit_is_not_charged(self):
         fetcher = WebContentFetcher(allow_private_urls=True, host_requests_per_minute=30)

@@ -1135,6 +1135,9 @@ _NEGATIVE_LENGTH_RE = re.compile(
 # Anything further off-screen than this is hiding, not layout.
 _OFFSCREEN_THRESHOLD = 1000
 
+# A CSS priority marker, which may carry whitespace after the bang.
+_PRIORITY_RE = re.compile(r"!\s*important")
+
 
 def _declaration_hides(prop: str, value: str) -> bool:
     """True when one CSS declaration makes an element invisible."""
@@ -1165,7 +1168,12 @@ def _is_hidden_style(style: str) -> bool:
         if not separator:
             continue
         prop = prop.strip().lower()
-        value = value.replace("!important", "").strip().lower()
+        # Lower-case *before* stripping the priority marker: CSS keywords are
+        # case-insensitive, so "display:none !IMPORTANT" is a valid way to hide
+        # an element, and a case-sensitive removal left the value as
+        # "none !IMPORTANT" — which matched nothing and read as visible.
+        # The regex also covers "! important", which CSS permits.
+        value = _PRIORITY_RE.sub("", value.lower()).strip()
         if value and _declaration_hides(prop, value):
             return True
     return False
@@ -1456,6 +1464,11 @@ class WebContentFetcher:
         if not self.allow_private_urls:
             await _validate_public_url(url)
 
+    async def _charge_host(self, url: str) -> None:
+        """Take one per-host token, if the cap is enabled."""
+        if self.host_limiter is not None:
+            await self.host_limiter.acquire(url)
+
     async def _prepare_hop(self, url: str) -> None:
         """Validate and throttle one request, including each redirect target.
 
@@ -1465,8 +1478,7 @@ class WebContentFetcher:
         cap this setting exists to impose.
         """
         await self._guard_url(url)
-        if self.host_limiter is not None:
-            await self.host_limiter.acquire(url)
+        await self._charge_host(url)
 
     FETCH_HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -1507,6 +1519,9 @@ class WebContentFetcher:
             ) as response:
                 if response.status_code == 429 and attempt == 0:
                     await _sleep_retry_after(response.headers)
+                    # _prepare_hop charged one token for this hop; the retry is a
+                    # second request to the same host, so it needs its own.
+                    await self._charge_host(url)
                     continue
                 location = response.headers.get("location")
                 if response.status_code in _REDIRECT_STATUSES and location:
@@ -1571,6 +1586,8 @@ class WebContentFetcher:
             ) as response:
                 if getattr(response, "status_code", None) == 429 and attempt == 0:
                     await _sleep_retry_after(getattr(response, "headers", None))
+                    # Same as the httpx path: the retry is another request.
+                    await self._charge_host(url)
                     continue
                 location = response.headers.get("location")
                 if response.status_code in _REDIRECT_STATUSES and location:
