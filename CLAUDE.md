@@ -45,12 +45,27 @@ uv run --with pip-audit pip-audit --desc
 Single-module server in `src/duckduckgo_mcp_server/server.py` with these main classes:
 
 - **`DuckDuckGoSearcher`** — Scrapes DuckDuckGo's HTML endpoint (`html.duckduckgo.com/html`) via POST requests. Parses results with BeautifulSoup. Handles SafeSearch (`kp` param) and region (`kl` param) configuration.
-- **`WebContentFetcher`** — Fetches arbitrary URLs, strips non-content elements (script, style, nav, header, footer), and returns cleaned text truncated to 8000 chars. Parsed pages are kept in an in-memory `TTLCache` so pagination does not re-download.
+- **`WebContentFetcher`** — Fetches arbitrary URLs, strips non-content elements (script, style, nav, header, footer) and hidden content (comments, `display:none`, `aria-hidden`, `<template>`, zero-width chars), and returns cleaned text truncated to 8000 chars. Responses are streamed and abandoned past `DDG_MAX_CONTENT_BYTES`; oversized `Content-Length` and non-text content types are refused before the body is read. Parsed pages are kept in an in-memory `TTLCache` (bounded by entries *and* bytes) so pagination does not re-download.
 - **`RateLimiter`** — Sliding-window limiter (default). `TokenBucketLimiter` is the optional burst-then-smooth strategy. `HostRateLimiter` adds a per-host fetch cap. HTTP 429 honors `Retry-After` and retries once. Cache hits skip the fetch limiter.
 - **`TTLCache`** — TTL + LRU cache used by `fetch_content`. Disabled when TTL or max entries is 0.
 - **`LinkRegistry`** — In-memory LRU map behind `ref://<id>` tokens (issue #43). Search output replaces URLs longer than `DDG_REF_URL_THRESHOLD` with tokens; `fetch_content` resolves them before the SSRF guard; `expand_link` returns the original. Shared module-level instance `links`.
 
+- **Untrusted-content envelope** — `_wrap_untrusted` fences search results and page text in `<untrusted-content id="...">` tags with a `secrets.token_hex(8)` id, fresh per call. The `[Content info: ...]` footer is emitted *outside* the closing tag; that is what stops a page reproducing it (in markdown mode `<hr>` renders to the same `---` rule).
+
 Three MCP tools are exposed: `search`, `fetch_content`, and `expand_link`.
+
+## Security posture
+
+This server feeds attacker-authored text to a model, so a few invariants matter when changing it:
+
+- Anything derived from a fetched page or a search result is untrusted. Keep it inside the envelope; never emit page-derived text after the closing tag.
+- That includes **error messages**. Header values, redirect targets and HTTP client messages are remote-controlled, so they go through `_error_with_detail`, which keeps a fixed server-authored summary outside and fences the detail. Provoking a rejection would otherwise be the cheapest way out of the envelope.
+- Result hrefs pass through `_sanitize_link` before reaching the registry: `expand_link` returns a URL as bare text, so a newline in it would be an injection primitive. It must not shorten the URL — truncating would register an address the page never linked to.
+- Rejection messages must not echo caller-supplied values (`_tokens_only_error`, `_unknown_ref_error`). They are emitted outside the envelope, and a caller acting on injected instructions controls those strings.
+- `_guard_url` runs on every redirect hop, not just the initial URL. Keep it that way.
+- The transport byte ceiling must stay *before* parsing. `max_length` is pagination, not a limit.
+- A non-loopback HTTP bind without a Host/Origin allow-list is refused in `main()`: the MCP SDK applies its localhost default only for loopback binds and otherwise leaves DNS-rebinding protection off entirely.
+- Instruction injection cannot be solved here, only made more expensive. Don't describe these controls as preventing it.
 
 ## Configuration
 
@@ -58,11 +73,17 @@ Environment variables read at startup (not per-request):
 - `DDG_SAFE_SEARCH`: `STRICT` | `MODERATE` (default) | `OFF`
 - `DDG_REGION`: Region code like `us-en`, `cn-zh`, `jp-ja`, `wt-wt`
 - `DDG_ALLOW_PRIVATE_URLS`: `1`/`true` to let `fetch_content` reach loopback/private/link-local/metadata addresses (default off — SSRF guard). Also settable via `--allow-private-urls`.
+- `DDG_FETCH_BACKEND`: `httpx` (default) | `curl` | `auto` — backend for `fetch_content`. Also `--fetch-backend`. (Env parity with `DDG_SEARCH_BACKEND`; MCP clients configure via an `env` block, so a CLI-only setting is unreachable there.)
+- `DDG_MAX_CONTENT_BYTES`: transport-level ceiling on bytes read from one response (default 5000000, `0` disables). Applied while downloading; `max_length` only paginates already-parsed text. Also `--max-content-bytes`.
+- `DDG_CACHE_MAX_BYTES`: total size budget for cached page text (default 16000000, `0` disables). Also `--cache-max-bytes`.
+- `DDG_CONTENT_ENVELOPE`: `on` (default) | `off` — wrap web content in `<untrusted-content id="...">` blocks with a random per-call id so a page cannot forge the server's own output. The `[Content info: ...]` footer is emitted outside the closing tag. **Env-only, no CLI flag:** the tool descriptions are built from this value and registered at import, before argv is parsed, so a later override would desync what the tools advertise from what they do.
+- `DDG_FETCH_URL_POLICY`: `any` (default) | `tokens` — under `tokens`, `fetch_content` accepts only `ref://` tokens minted from this server's own search results, and search tokenises every result. Blocks in-page links and user-pasted URLs by design. Covers fetch URLs only: the `search` query is still a free-form outbound field (a weaker channel, since the data reaches DuckDuckGo rather than the attacker). Also `--fetch-url-policy`.
+- `DDG_MAX_URL_LENGTH`: refuse URLs longer than this, redirect targets included (default 2048, `0` disables). Also `--max-url-length`.
 - `DDG_SEARCH_BACKEND`: `auto` (default) | `httpx` | `curl` — HTTP backend for the search tool. `auto` falls back to curl_cffi Chrome TLS impersonation when DuckDuckGo returns a fingerprint block (HTTP 202/403); `curl`/fallback need the `[browser]` extra. Also settable via `--search-backend`.
 - `DDG_ALLOWED_HOSTS` / `DDG_ALLOWED_ORIGINS`: comma-separated Host/Origin allow-lists for the HTTP transports (DNS-rebinding protection). Needed behind a reverse proxy / in Docker to avoid `421 Misdirected Request`. Also `--allowed-hosts` / `--allowed-origins`, or `--disable-dns-rebinding-protection` (`DDG_DISABLE_DNS_REBINDING_PROTECTION`).
 - `DDG_CA_CERTS`: path to a PEM CA bundle for verifying TLS on outbound requests (needed behind TLS-intercepting proxies — httpx no longer reads `SSL_CERT_FILE`). `DDG_SSL_VERIFY=0` disables verification entirely (discouraged). Also `--ca-certs` / `--no-ssl-verify`. Applies to all four client sites (httpx + curl_cffi, search + fetch).
 - `DDG_RATE_LIMIT_STRATEGY`: `sliding` (default) or `token_bucket`. Also `--rate-limit-strategy`.
-- `DDG_SEARCH_RPM` / `DDG_FETCH_RPM` / `DDG_FETCH_HOST_RPM`: rate-limit caps (defaults 30 / 20 / 0; the per-host cap is opt-in). Also `--search-rpm` / `--fetch-rpm` / `--fetch-host-rpm`.
+- `DDG_SEARCH_RPM` / `DDG_FETCH_RPM` / `DDG_FETCH_HOST_RPM`: rate-limit caps (defaults 30 / 20 / 6; the per-host cap is on by default in this fork, upstream defaults it to 0). Also `--search-rpm` / `--fetch-rpm` / `--fetch-host-rpm`.
 - `DDG_CACHE_TTL` / `DDG_CACHE_MAX_ENTRIES`: in-memory `fetch_content` cache (default 300s / 64 entries). `0` disables. Also `--cache-ttl` / `--cache-max-entries`.
 - `DDG_PARSE_MODE`: default `fetch_content` extractor (`text` / `main` / `markdown`). Also `--parse-mode`. Per-call `parse_mode` overrides it. Cache keys include the mode.
 - `DDG_REF_URL_THRESHOLD`: result URLs longer than this are shown as `ref://` tokens (default 120, `0` disables). Also `--ref-url-threshold`.

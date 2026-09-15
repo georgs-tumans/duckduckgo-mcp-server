@@ -1,0 +1,31 @@
+# Keep the build context (and therefore the image) to what is actually needed.
+# `COPY . /app` previously pulled in .git, virtualenvs and caches.
+.git
+.gitignore
+.github
+.venv
+venv/
+env/
+
+__pycache__/
+*.py[cod]
+*.so
+
+build/
+dist/
+*.egg-info/
+.eggs/
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+*.log
+.env
+.DS_Store
+.idea/
+.vscode/

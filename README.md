@@ -17,7 +17,9 @@ uvx duckduckgo-mcp-server
 - **Web Search**: Search DuckDuckGo with advanced rate limiting and result formatting
 - **Content Fetching**: Retrieve and parse webpage content with intelligent text extraction
 - **Long URL Shortening**: Over-long result URLs become short `ref://` tokens that `fetch_content` accepts directly, saving context
-- **Rate Limiting**: Built-in protection against rate limits for both search and content fetching
+- **Rate Limiting**: Built-in protection against rate limits for both search and content fetching, including a per-host cap
+- **Untrusted-content fencing**: Web content is returned inside id-tagged blocks so a page cannot impersonate the server's own output
+- **Hardened fetching**: Response size ceiling, content-type filtering, URL length cap, SSRF guard, and an optional token-only URL policy
 - **Error Handling**: Comprehensive error handling and logging
 - **LLM-Friendly Output**: Results formatted specifically for large language model consumption
 
@@ -68,26 +70,9 @@ Add the following configuration:
 }
 ```
 
-**Configuration Options:**
-- `DDG_SAFE_SEARCH`: SafeSearch filtering level (optional)
-  - `STRICT`: Maximum content filtering (kp=1)
-  - `MODERATE`: Balanced filtering (kp=-1, default if not specified)
-  - `OFF`: No content filtering (kp=-2)
-- `DDG_REGION`: Default region/language code (optional, examples below)
-  - `us-en`: United States (English)
-  - `cn-zh`: China (Chinese)
-  - `jp-ja`: Japan (Japanese)
-  - `wt-wt`: No specific region
-  - Leave empty for DuckDuckGo's default behavior
-- `DDG_CA_CERTS`: Path to a PEM CA bundle used to verify TLS certificates on outbound requests (optional). Needed behind TLS-intercepting proxies — see [Running behind a TLS-intercepting proxy](#running-behind-a-tls-intercepting-proxy).
-- `DDG_RATE_LIMIT_STRATEGY`: `sliding` (default, historical 60s window) or `token_bucket` (burst, then smooth).
-- `DDG_SEARCH_RPM`: Search requests per minute (default: `30`).
-- `DDG_FETCH_RPM`: Global `fetch_content` requests per minute (default: `20`).
-- `DDG_FETCH_HOST_RPM`: Optional per-host fetch cap (default: `0`, off). Set a positive number to enable.
-- `DDG_CACHE_TTL`: Seconds to keep a parsed page in the in-memory `fetch_content` cache (default: `300`). Paginated reads of the same URL reuse one download. Set `0` to disable.
-- `DDG_CACHE_MAX_ENTRIES`: Maximum pages kept in that cache (default: `64`). Least-recently-used eviction. Set `0` to disable.
-- `DDG_PARSE_MODE`: Default `fetch_content` extractor (`text`, `main`, or `markdown`). Default is `text` (historical flattened page). Per-call `parse_mode` overrides this.
-- `DDG_REF_URL_THRESHOLD`: Search-result URLs longer than this many characters are replaced with short `ref://<id>` tokens (default: `120`). Set `0` to always show full URLs. Also `--ref-url-threshold`.
+**Common options** (every setting is listed in [Configuration](#configuration)):
+- `DDG_SAFE_SEARCH`: SafeSearch filtering level - `STRICT` (kp=1), `MODERATE` (kp=-1, default), or `OFF` (kp=-2).
+- `DDG_REGION`: Default region/language code - e.g. `us-en`, `cn-zh`, `jp-ja`, or `wt-wt` for no region. Leave empty for DuckDuckGo's default.
 
 3. Restart Claude Desktop
 
@@ -111,15 +96,22 @@ uvx duckduckgo-mcp-server --transport streamable-http
 
 The default transport is `stdio`, which is used by Claude Desktop and Claude Code.
 
-When running with `sse` or `streamable-http`, override the default bind address (`127.0.0.1:8000`) with the `--host` and `--port` flags:
+When running with `sse` or `streamable-http`, override the default bind address (`127.0.0.1:8000`) with the `--host` and `--port` flags.
+
+Binding to anything other than loopback **requires** an explicit `Host`/`Origin` allow-list — the server refuses to start otherwise. See [Running behind a reverse proxy or in Docker](#running-behind-a-reverse-proxy-or-in-docker) for why:
 
 ```bash
-uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
+uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070 \
+  --allowed-hosts ddg-mcp.example.com "ddg-mcp.example.com:*"
 ```
+
+> **These transports have no authentication.** Anyone who can reach the port can run searches and fetch pages through this server. Bind to loopback unless you have put authentication in front of it.
 
 #### Running behind a reverse proxy or in Docker
 
-The MCP SDK enables DNS-rebinding protection for the HTTP transports and, by default, only accepts `Host`/`Origin` headers for `localhost`. Behind a reverse proxy or in a container the client's `Host` header won't match, so requests fail with **`421 Misdirected Request`**.
+The MCP SDK auto-enables DNS-rebinding protection **only when the bind address is loopback** (`127.0.0.1`, `localhost`, `::1`), accepting `Host`/`Origin` headers for localhost. Behind a reverse proxy or in a container the client's `Host` header won't match, so requests fail with **`421 Misdirected Request`**.
+
+For any other bind address the SDK applies *no* Host or Origin validation at all unless it is configured. That is why this server refuses to start on a non-loopback address without an allow-list — otherwise any website the user visits could drive the server over CORS.
 
 Fix it by allow-listing the host(s) and origin(s) clients actually use (preferred over disabling protection). Values support `host`, `host:port`, and wildcard-port `host:*`:
 
@@ -131,7 +123,13 @@ uvx duckduckgo-mcp-server --transport streamable-http --host 0.0.0.0 --port 7070
 
 Equivalent environment variables (comma-separated) are also available: `DDG_ALLOWED_HOSTS`, `DDG_ALLOWED_ORIGINS`.
 
-As a last resort you can turn the check off entirely with `--disable-dns-rebinding-protection` (or `DDG_DISABLE_DNS_REBINDING_PROTECTION=1`). Prefer an allow-list — disabling protection removes a defense against DNS-rebinding attacks. When nothing is configured, the secure localhost-only default is preserved.
+> **`--allowed-origins` on its own will not start.** The SDK validates `Host` before `Origin`, against an allow-list that would be empty - so an origins-only configuration answers `421` to *every* request, including from the origin you allow-listed. Always pass `--allowed-hosts` as well. (This applied to loopback binds too, since supplying any settings suppresses the SDK's localhost default.)
+
+As a last resort you can turn the check off entirely with `--disable-dns-rebinding-protection` (or `DDG_DISABLE_DNS_REBINDING_PROTECTION=1`). Prefer an allow-list — disabling protection removes a defense against DNS-rebinding attacks.
+
+On a loopback bind with nothing configured, the SDK's localhost-only default applies and no allow-list is needed. On any other bind you must pass an allow-list or explicitly disable the check; the server will not start silently unprotected.
+
+CORS is scoped to `--allowed-origins`. When no origins are configured the CORS middleware is not installed at all, so browser pages cannot read this server's responses.
 
 #### Running behind a TLS-intercepting proxy
 
@@ -144,6 +142,71 @@ uvx duckduckgo-mcp-server --ca-certs /path/to/proxy-ca.pem
 Or set `DDG_CA_CERTS=/path/to/proxy-ca.pem`. The bundle is used by both the `search` and `fetch_content` tools, on the httpx and curl backends alike.
 
 As a last resort, `--no-ssl-verify` (or `DDG_SSL_VERIFY=0`) disables certificate verification entirely. This exposes traffic to interception by anyone on the network path — prefer `--ca-certs`.
+
+### Running in a container
+
+The repo ships a `Dockerfile`, and CI publishes a multi-arch image to GHCR. Build it yourself:
+
+```bash
+podman build -t duckduckgo-mcp-server .
+```
+
+Or pull the published image:
+
+```bash
+podman pull ghcr.io/georgs-tumans/duckduckgo-mcp-server:latest
+```
+
+Swap `podman` for `docker` throughout if that is what you run.
+
+#### Wiring it into an MCP client
+
+A ready-to-copy config is in [`example.mcp.json`](example.mcp.json). Copy the `ddg-search` entry into your client's config - LM Studio's `mcp.json`, Claude Desktop's `claude_desktop_config.json`, or a project `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "ddg-search": {
+      "command": "podman",
+      "args": [
+        "run", "-i", "--rm",
+        "--read-only", "--tmpfs", "/tmp",
+        "--cap-drop=ALL", "--security-opt=no-new-privileges",
+        "--user", "1000:1000",
+        "--memory=512m", "--pids-limit=128",
+        "-e", "DDG_SAFE_SEARCH=MODERATE",
+        "-e", "DDG_PARSE_MODE=markdown",
+        "-e", "DDG_MAX_CONTENT_BYTES=5000000",
+        "-e", "DDG_FETCH_HOST_RPM=6",
+        "ghcr.io/georgs-tumans/duckduckgo-mcp-server:latest"
+      ]
+    }
+  }
+}
+```
+
+To use the stricter [token-only URL policy](#notes-on-the-security-settings), add `"-e", "DDG_FETCH_URL_POLICY=tokens"` - but read the tradeoff first: the model will no longer be able to follow links inside a page or fetch URLs you paste.
+
+#### Two things that trip people up
+
+**`-i` is required.** The server speaks MCP over stdio, so the container needs stdin held open. Without `-i` it appears to start and then hangs with no error.
+
+**The `env` block does not reach the container.** In an `.mcp.json`, `env` sets variables for the `podman` process, not for the process inside the container. Either pass values inline in `args` as above, or forward them by bare name:
+
+```json
+"args": ["run", "-i", "--rm", "-e", "DDG_SAFE_SEARCH", "ghcr.io/georgs-tumans/duckduckgo-mcp-server:latest"],
+"env": { "DDG_SAFE_SEARCH": "STRICT" }
+```
+
+A bare `-e NAME` (no `=`) forwards the value from the surrounding environment; `-e NAME=value` sets it directly and ignores the `env` block.
+
+#### About the hardening flags
+
+`--read-only`, `--cap-drop=ALL`, `--security-opt=no-new-privileges` and `--user 1000:1000` are ordinary least-privilege settings; the image is built to run fine under all of them, writing nothing outside `/tmp`.
+
+`--memory=512m` is defence-in-depth for response size. The server already caps downloads at `DDG_MAX_CONTENT_BYTES`, but a memory ceiling means a pathological page gets the *container* OOM-killed rather than pressuring the host. The two are complementary. (On rootless Podman, memory limits need cgroups v2 delegation; if yours warns and ignores the flag, the in-process cap still applies.)
+
+**The container is not an SSRF boundary.** Rootless Podman networking can still reach your LAN, so leave `DDG_ALLOW_PRIVATE_URLS` unset - the server's own guard is what keeps `fetch_content` away from internal addresses, not the container.
 
 ### Backends (bypassing bot detection)
 
@@ -229,6 +292,74 @@ uv run python -m pytest src/duckduckgo_mcp_server/test_server.py -v
 uv run python -m pytest src/duckduckgo_mcp_server/test_e2e.py -v
 ```
 
+## Configuration
+
+Every setting can be supplied as an environment variable - the usual way to configure an MCP server, via the `env` block in your client config. Most also have a CLI flag, and **a CLI flag overrides the environment variable**; where the table shows `-` in the flag column, the environment variable is the only way to set it.
+
+### Search
+
+| Environment variable | CLI flag | Default | What it does |
+| --- | --- | --- | --- |
+| `DDG_SAFE_SEARCH` | - | `MODERATE` | SafeSearch level: `STRICT`, `MODERATE`, `OFF`. |
+| `DDG_REGION` | - | none | Default region/language, e.g. `us-en`, `de-de`, `jp-ja`, `wt-wt` for none. |
+| `DDG_SEARCH_BACKEND` | `--search-backend` | `auto` | HTTP backend for search: `httpx`, `curl`, `auto`. `curl` and the `auto` fallback need the `[browser]` extra. |
+| `DDG_SEARCH_RPM` | `--search-rpm` | `30` | Search requests per minute. |
+| `DDG_REF_URL_THRESHOLD` | `--ref-url-threshold` | `120` | Result URLs longer than this become `ref://` tokens. `0` always shows full URLs. |
+
+### Fetching pages
+
+| Environment variable | CLI flag | Default | What it does |
+| --- | --- | --- | --- |
+| `DDG_FETCH_BACKEND` | `--fetch-backend` | `httpx` | HTTP backend for `fetch_content`: `httpx`, `curl`, `auto`. |
+| `DDG_PARSE_MODE` | `--parse-mode` | `text` | Default extractor: `text`, `main`, `markdown`. A per-call `parse_mode` overrides it. |
+| `DDG_FETCH_RPM` | `--fetch-rpm` | `20` | Global fetch requests per minute. |
+| `DDG_FETCH_HOST_RPM` | `--fetch-host-rpm` | `6` | Per-host fetch cap, so one site cannot spend the whole budget. `0` disables. |
+| `DDG_RATE_LIMIT_STRATEGY` | `--rate-limit-strategy` | `sliding` | `sliding` (60s window) or `token_bucket` (burst, then smooth). |
+| `DDG_CACHE_TTL` | `--cache-ttl` | `300` | Seconds a parsed page stays cached, so paginated reads reuse one download. `0` disables. |
+| `DDG_CACHE_MAX_ENTRIES` | `--cache-max-entries` | `64` | Maximum cached pages (LRU). `0` disables. |
+| `DDG_CACHE_MAX_BYTES` | `--cache-max-bytes` | `16000000` | Total size budget for cached text, so a few huge pages cannot dominate memory. `0` disables. |
+
+### Security
+
+| Environment variable | CLI flag | Default | What it does |
+| --- | --- | --- | --- |
+| `DDG_MAX_CONTENT_BYTES` | `--max-content-bytes` | `5000000` | Bytes read from one response before the rest is dropped. `0` for no limit. |
+| `DDG_MAX_URL_LENGTH` | `--max-url-length` | `2048` | Refuse URLs longer than this, redirect targets included. `0` disables. |
+| `DDG_FETCH_URL_POLICY` | `--fetch-url-policy` | `any` | `any` allows any public http(s) URL. `tokens` accepts only `ref://` tokens this server issued. See below. |
+| `DDG_CONTENT_ENVELOPE` | - | `on` | Wrap web content in id-tagged `<untrusted-content>` blocks so it cannot impersonate the server's own output. Environment-only by design (see below). |
+| `DDG_ALLOW_PRIVATE_URLS` | `--allow-private-urls` | off | Allow `fetch_content` to reach loopback/private/link-local/metadata addresses. Leave off unless you trust the caller. |
+| `DDG_SSL_VERIFY` | `--no-ssl-verify` | `1` | Set `0` to disable TLS verification entirely. Discouraged; prefer `DDG_CA_CERTS`. |
+| `DDG_CA_CERTS` | `--ca-certs` | none | PEM CA bundle for outbound TLS, for TLS-intercepting proxies. |
+
+### HTTP transports only (`--transport sse` / `streamable-http`)
+
+These do nothing under the default `stdio` transport.
+
+| Environment variable | CLI flag | Default | What it does |
+| --- | --- | --- | --- |
+| `DDG_ALLOWED_HOSTS` | `--allowed-hosts` | none | Allowed `Host` values. Accepts `host`, `host:port`, `host:*`. |
+| `DDG_ALLOWED_ORIGINS` | `--allowed-origins` | none | Allowed `Origin` values. **Requires `DDG_ALLOWED_HOSTS` too** (see below). Also scopes CORS; with none set, CORS is not enabled at all. Wildcard-port values are honoured for CORS as well as Host. |
+| `DDG_DISABLE_DNS_REBINDING_PROTECTION` | `--disable-dns-rebinding-protection` | off | Turn Host/Origin validation off entirely. Prefer an allow-list. |
+| - | `--host` / `--port` | `127.0.0.1` / `8000` | Bind address. **A non-loopback bind requires an allow-list or the server refuses to start** - see [Running behind a reverse proxy or in Docker](#running-behind-a-reverse-proxy-or-in-docker). |
+
+### Notes on the security settings
+
+**`DDG_FETCH_URL_POLICY=tokens` has a real usability cost.** Under `tokens`, `fetch_content` accepts only `ref://` tokens that this server issued from its own search results. That means the model **cannot follow a link it found inside a fetched page**, and **cannot fetch a URL you pasted into the chat**. Only results from its own searches are reachable.
+
+That restriction is the point. The way an injected instruction gets data out of a model's context is by building a URL containing it (`https://attacker.example/?d=<secret>`). Tokens are issued *before* any secret is known, so the model holds opaque handles with no field to encode data into. A residual channel remains - an attacker can pre-place many links and signal roughly a byte per fetch by which one is chosen - so this narrows the channel by orders of magnitude rather than proving it closed. `DDG_MAX_URL_LENGTH` and `DDG_FETCH_HOST_RPM` constrain what is left.
+
+**What `tokens` does not cover.** It restricts `fetch_content` URLs only. The `search` tool still takes a free-form query, so an injected instruction could ask the model to search for a secret and that text would reach DuckDuckGo. That is a far weaker channel than an attacker-chosen URL - the data goes to DuckDuckGo, who the attacker cannot query for it - but it is not closed, and this setting should not be read as "no data can leave".
+
+Use `tokens` when this server shares an agent with tools that hold secrets. Leave it at `any` for ordinary browsing where you want to paste URLs.
+
+**Hidden-text stripping has a known limit.** Content hidden by inline `style` attributes (`display:none`, `visibility:hidden`/`collapse`, a zero `opacity` or `font-size`, off-screen positioning beyond 1000px), `hidden`/`aria-hidden` elements, `<template>`, `<noscript>`, HTML comments, and zero-width/bidi characters is removed in every parse mode. Only values that are *exactly* zero count - `opacity: 0.05` and `font-size: 0.875rem` are visible text and are kept. Text hidden by an *external stylesheet or a `<style>` block* - true white-on-white - is **not** detected; that needs full CSS cascade resolution and is out of scope.
+
+**`DDG_CONTENT_ENVELOPE` has no CLI flag on purpose.** The `search` and `fetch_content` tool descriptions are built from this value and registered with the MCP SDK when the module is imported, which happens before command-line arguments are parsed. A flag applied afterwards would leave the tools advertising a fence they no longer apply - telling a client to trust text that is actually web content, the exact mismatch the envelope exists to prevent. Set it in the environment so the description and the behaviour are decided together.
+
+**The HTTP transports have no authentication.** Anyone who can reach the port can search and fetch through this server. Bind to loopback unless you have put authentication in front of it.
+
+**`DDG_FETCH_HOST_RPM` defaults to `6`, not off.** Upstream defaults this to `0` (disabled); this fork enables it because it throttles the exfiltration channel described above. Set it to `0` for the upstream behaviour.
+
 ## Available Tools
 
 ### 1. Search Tool
@@ -311,7 +442,7 @@ The full original URL, or an error if the token is unknown. Tokens live in memor
 
 - Search: 30 requests per minute by default (`DDG_SEARCH_RPM` / `--search-rpm`)
 - Content fetching: 20 requests per minute globally (`DDG_FETCH_RPM` / `--fetch-rpm`)
-- Optional per-host fetch cap, off by default (`DDG_FETCH_HOST_RPM` / `--fetch-host-rpm`)
+- Per-host fetch cap, 6 per minute by default (`DDG_FETCH_HOST_RPM` / `--fetch-host-rpm`; `0` disables)
 - Strategies: `sliding` (default) or `token_bucket` via `DDG_RATE_LIMIT_STRATEGY` / `--rate-limit-strategy`
 - HTTP 429 responses honor `Retry-After` (capped at 30s) and retry once
 - Cache hits on `fetch_content` skip both the download and the fetch rate limiter
@@ -320,9 +451,10 @@ The full original URL, or an error if the token is unknown. Tokens live in memor
 
 - In-memory TTL cache of the fully parsed page (before pagination)
 - Default TTL 300 seconds, 64 entries, least-recently-used eviction
+- Also bounded by total size (`DDG_CACHE_MAX_BYTES`, default 16 MB) so a few very large pages cannot dominate memory
 - Errors are never cached
-- Configure with `DDG_CACHE_TTL` / `DDG_CACHE_MAX_ENTRIES` or `--cache-ttl` / `--cache-max-entries`
-- Set either value to `0` to disable
+- Configure with `DDG_CACHE_TTL` / `DDG_CACHE_MAX_ENTRIES` / `DDG_CACHE_MAX_BYTES` or the matching flags
+- Set any of them to `0` to disable that limit
 
 ### Result Processing
 
@@ -342,6 +474,11 @@ The full original URL, or an error if the token is unknown. Tokens live in memor
 | `markdown` | Same primary content, rendered as lightweight markdown (headings, lists, links, code). |
 
 ### Content Safety
+
+- **Untrusted-content envelope**: search results and fetched pages are returned inside `<untrusted-content id="...">` blocks with a random per-call id. Anything outside the matching closing tag - such as the `[Content info: ...]` footer - comes from this server and cannot be forged by a page. Disable with `DDG_CONTENT_ENVELOPE=off`.
+- **Hidden-text stripping**: HTML comments, `<template>`/`<noscript>`, `hidden`/`aria-hidden` elements, inline-styled invisible elements, and zero-width/bidi characters are removed in every parse mode. See the limit noted under [Configuration](#notes-on-the-security-settings).
+- **Download limits**: responses are streamed and abandoned past `DDG_MAX_CONTENT_BYTES`, oversized `Content-Length` is refused up front, and non-text content types are not parsed.
+- **SSRF guard**: `fetch_content` refuses loopback, private, link-local, and cloud-metadata addresses by default, revalidating every redirect hop.
 
 - **SafeSearch Filtering**: Configured at server startup via `DDG_SAFE_SEARCH` environment variable
   - Controlled by administrators, not modifiable by AI assistants

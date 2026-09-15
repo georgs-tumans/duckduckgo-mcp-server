@@ -18,6 +18,28 @@ jobs:
       - run: uv sync
       - run: uv run python -m pytest src/duckduckgo_mcp_server/ -v
 
+  # The default `uv sync` omits the optional [browser] extra, so curl_cffi is
+  # absent and every curl-backend test is skipped. Both curl paths stream
+  # responses to enforce the byte ceiling, and that code would otherwise never
+  # run against real curl_cffi in CI — an API or context-manager change could
+  # ship unnoticed.
+  test-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv python install 3.12
+      - run: uv sync --extra browser
+      - name: Tests with the curl backend enabled
+        run: uv run python -m pytest src/duckduckgo_mcp_server/ -v
+      - name: Fail if the curl tests were skipped
+        run: |
+          uv run python -m pytest src/duckduckgo_mcp_server/test_server.py \
+            -k "CurlSearchPathLive" -q --no-header \
+            | tee /tmp/curl.txt
+          grep -qE "[1-9][0-9]* passed" /tmp/curl.txt \
+            || { echo "::error::curl backend tests did not run"; exit 1; }
+
   quality:
     runs-on: ubuntu-latest
     steps:
@@ -27,6 +49,14 @@ jobs:
       - run: uv sync
       - name: Lint (ruff)
         run: uv run ruff check .
+      # The configuration reference drifted before: six DDG_* variables were
+      # documented only in scattered prose, and DDG_FETCH_BACKEND did not exist
+      # at all. Fail the build if the README stops covering what the code reads.
+      - name: Configuration reference covers every setting
+        run: |
+          diff <(grep -ohE 'DDG_[A-Z_]+' src/duckduckgo_mcp_server/server.py | sort -u) \
+               <(grep -ohE 'DDG_[A-Z_]+' README.md | sort -u) \
+            || { echo "::error::README.md and server.py disagree on DDG_* settings (left=code, right=README)"; exit 1; }
       # Reports known vulnerabilities in dependencies. Non-blocking: most findings
       # are in transitive deps we can't directly pin, so this surfaces them without
       # gating every PR on upstream advisories.
