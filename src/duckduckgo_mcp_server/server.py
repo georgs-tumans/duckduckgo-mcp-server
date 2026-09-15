@@ -1120,18 +1120,55 @@ def _strip_chrome(soup: BeautifulSoup, tags=None) -> BeautifulSoup:
     return soup
 
 
-# Inline styles that hide an element from a human reader while leaving its text
-# in the extracted output — the cheapest way to smuggle instructions into a page
-# that looks innocuous when opened in a browser.
-_HIDDEN_STYLE_PATTERN = re.compile(
-    r"display\s*:\s*none"
-    r"|visibility\s*:\s*hidden"
-    r"|opacity\s*:\s*0(?!\s*\.\s*[1-9])"
-    r"|font-size\s*:\s*0"
-    r"|(?:left|top|text-indent)\s*:\s*-\s*\d{3,}"
-    ,
-    re.IGNORECASE,
+# A length/number that is exactly zero, with or without a unit: 0, 0.0, .0, 0px.
+# Deliberately does not match 0.875 — see _is_hidden_style.
+_ZERO_VALUE_RE = re.compile(
+    r"^(?:0+(?:\.0*)?|\.0+)\s*"
+    r"(?:px|pt|em|rem|ex|ch|%|vw|vh|vmin|vmax|cm|mm|in|pc|q)?$"
 )
+
+# A negative offset large enough to park content outside the viewport.
+_NEGATIVE_LENGTH_RE = re.compile(
+    r"^-\s*(\d+(?:\.\d+)?)\s*(?:px|pt|em|rem|%|vw|vh)?$"
+)
+
+# Anything further off-screen than this is hiding, not layout.
+_OFFSCREEN_THRESHOLD = 1000
+
+
+def _declaration_hides(prop: str, value: str) -> bool:
+    """True when one CSS declaration makes an element invisible."""
+    if prop == "display":
+        return value == "none"
+    if prop == "visibility":
+        return value in ("hidden", "collapse")
+    if prop in ("opacity", "font-size"):
+        return bool(_ZERO_VALUE_RE.match(value))
+    if prop in ("left", "top", "text-indent"):
+        match = _NEGATIVE_LENGTH_RE.match(value)
+        return bool(match) and float(match.group(1)) >= _OFFSCREEN_THRESHOLD
+    return False
+
+
+def _is_hidden_style(style: str) -> bool:
+    """True when an inline style renders the element invisible.
+
+    Parsed declaration by declaration rather than matched as a substring. A
+    pattern like ``font-size\\s*:\\s*0`` also matches ``font-size: 0.875rem`` —
+    one of the most common values on the web — and ``opacity\\s*:\\s*0`` matches
+    ``opacity: 0.05``. Treating those as hidden silently deleted perfectly
+    visible text from the page, which is a far worse failure than missing a
+    smuggled instruction.
+    """
+    for declaration in (style or "").split(";"):
+        prop, separator, value = declaration.partition(":")
+        if not separator:
+            continue
+        prop = prop.strip().lower()
+        value = value.replace("!important", "").strip().lower()
+        if value and _declaration_hides(prop, value):
+            return True
+    return False
 
 # Tags whose content is never shown as page text.
 _HIDDEN_TAGS = ("template", "noscript")
@@ -1174,7 +1211,9 @@ def _strip_hidden(soup: BeautifulSoup) -> BeautifulSoup:
         if not getattr(element, "decomposed", False):
             element.decompose()
 
-    for element in soup.select("[hidden], [aria-hidden='true']"):
+    # The `i` flag matters: aria-hidden="TRUE" is honoured by browsers, so a
+    # case-sensitive selector would let that spelling through the filter.
+    for element in soup.select("[hidden], [aria-hidden='true' i]"):
         # A parent may already have been removed on an earlier pass.
         if not getattr(element, "decomposed", False):
             element.decompose()
@@ -1182,7 +1221,7 @@ def _strip_hidden(soup: BeautifulSoup) -> BeautifulSoup:
     for element in soup.find_all(style=True):
         if getattr(element, "decomposed", False):
             continue
-        if _HIDDEN_STYLE_PATTERN.search(element.get("style") or ""):
+        if _is_hidden_style(element.get("style") or ""):
             element.decompose()
 
     return soup
@@ -1417,6 +1456,18 @@ class WebContentFetcher:
         if not self.allow_private_urls:
             await _validate_public_url(url)
 
+    async def _prepare_hop(self, url: str) -> None:
+        """Validate and throttle one request, including each redirect target.
+
+        The per-host cap has to be charged per hop, not once per tool call:
+        otherwise a redirector spends only its own quota while the host it
+        forwards to receives up to the entire global budget, which is exactly the
+        cap this setting exists to impose.
+        """
+        await self._guard_url(url)
+        if self.host_limiter is not None:
+            await self.host_limiter.acquire(url)
+
     FETCH_HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
@@ -1477,7 +1528,7 @@ class WebContentFetcher:
         async with httpx.AsyncClient(follow_redirects=False, verify=self.ssl_verify) as client:
             current = url
             for _ in range(_MAX_REDIRECTS + 1):
-                await self._guard_url(current)
+                await self._prepare_hop(current)
                 body, next_url = await self._hop_httpx(client, current)
                 if next_url is None:
                     return body
@@ -1500,7 +1551,7 @@ class WebContentFetcher:
         async with AsyncSession(impersonate="chrome131", verify=self.ssl_verify) as client:
             current = url
             for _ in range(_MAX_REDIRECTS + 1):
-                await self._guard_url(current)
+                await self._prepare_hop(current)
                 body, next_url = await self._hop_curl(client, current)
                 if next_url is None:
                     return body
@@ -1585,16 +1636,19 @@ class WebContentFetcher:
             # so it has no field in which to encode data into a request.
             return _tokens_only_error(url)
 
+        # These rejections are emitted outside the envelope, so like the other
+        # error paths they must not repeat back what the caller sent: the values
+        # are caller-controlled and could carry newlines or envelope-like text.
         effective_backend = backend if backend is not None else self.default_backend
         if effective_backend not in SUPPORTED_FETCH_BACKENDS:
             return (
-                f"Error: Unknown fetch backend '{effective_backend}'. "
+                "Error: unknown fetch backend requested. "
                 f"Supported: {SUPPORTED_FETCH_BACKENDS}"
             )
         effective_mode = (parse_mode if parse_mode is not None else self.default_parse_mode).lower()
         if effective_mode not in SUPPORTED_PARSE_MODES:
             return (
-                f"Error: Unknown parse_mode '{effective_mode}'. "
+                "Error: unknown parse_mode requested. "
                 f"Supported: {SUPPORTED_PARSE_MODES}"
             )
 
@@ -1614,8 +1668,9 @@ class WebContentFetcher:
             text, transport_truncated = cached if cache_hit else (None, False)
 
             if not cache_hit:
-                if self.host_limiter is not None:
-                    await self.host_limiter.acquire(url)
+                # The per-host cap is charged inside _prepare_hop, once per
+                # request including redirect targets. The global limiter stays
+                # here: it is a budget per tool call, not per HTTP hop.
                 await self.rate_limiter.acquire()
 
                 await ctx.info(
