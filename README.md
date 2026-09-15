@@ -326,7 +326,7 @@ Every setting can be supplied as an environment variable - the usual way to conf
 | `DDG_MAX_CONTENT_BYTES` | `--max-content-bytes` | `5000000` | Bytes read from one response before the rest is dropped. `0` for no limit. |
 | `DDG_MAX_URL_LENGTH` | `--max-url-length` | `2048` | Refuse URLs longer than this, redirect targets included. `0` disables. |
 | `DDG_FETCH_URL_POLICY` | `--fetch-url-policy` | `any` | `any` allows any public http(s) URL. `tokens` accepts only `ref://` tokens this server issued. See below. |
-| `DDG_CONTENT_ENVELOPE` | `--content-envelope` | `on` | Wrap web content in id-tagged `<untrusted-content>` blocks so it cannot impersonate the server's own output. |
+| `DDG_CONTENT_ENVELOPE` | - | `on` | Wrap web content in id-tagged `<untrusted-content>` blocks so it cannot impersonate the server's own output. Environment-only by design (see below). |
 | `DDG_ALLOW_PRIVATE_URLS` | `--allow-private-urls` | off | Allow `fetch_content` to reach loopback/private/link-local/metadata addresses. Leave off unless you trust the caller. |
 | `DDG_SSL_VERIFY` | `--no-ssl-verify` | `1` | Set `0` to disable TLS verification entirely. Discouraged; prefer `DDG_CA_CERTS`. |
 | `DDG_CA_CERTS` | `--ca-certs` | none | PEM CA bundle for outbound TLS, for TLS-intercepting proxies. |
@@ -353,6 +353,8 @@ That restriction is the point. The way an injected instruction gets data out of 
 Use `tokens` when this server shares an agent with tools that hold secrets. Leave it at `any` for ordinary browsing where you want to paste URLs.
 
 **Hidden-text stripping has a known limit.** Content hidden by inline `style` attributes (`display:none`, `visibility:hidden`, `opacity:0`, off-screen positioning), `hidden`/`aria-hidden` elements, `<template>`, `<noscript>`, HTML comments, and zero-width/bidi characters is removed in every parse mode. Text hidden by an *external stylesheet or a `<style>` block* - true white-on-white - is **not** detected; that needs full CSS cascade resolution and is out of scope.
+
+**`DDG_CONTENT_ENVELOPE` has no CLI flag on purpose.** The `search` and `fetch_content` tool descriptions are built from this value and registered with the MCP SDK when the module is imported, which happens before command-line arguments are parsed. A flag applied afterwards would leave the tools advertising a fence they no longer apply - telling a client to trust text that is actually web content, the exact mismatch the envelope exists to prevent. Set it in the environment so the description and the behaviour are decided together.
 
 **The HTTP transports have no authentication.** Anyone who can reach the port can search and fetch through this server. Bind to loopback unless you have put authentication in front of it.
 

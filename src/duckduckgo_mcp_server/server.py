@@ -225,20 +225,34 @@ def _validated_url_policy(value: str) -> str:
 
 
 def _tokens_only_error(url: str) -> str:
+    """Explain a tokens-policy rejection without echoing the rejected URL.
+
+    The URL is caller-supplied, and a caller acting on injected instructions can
+    put newlines or envelope-like text in it. Echoing it here would place
+    attacker-chosen text in the unfenced region advertised as server-authored,
+    and the value adds nothing: the caller already knows what it passed.
+    """
+    del url  # deliberately not echoed; see above
     return (
         "Error: this server runs with fetch_url_policy=tokens, so fetch_content "
         "accepts only ref:// tokens it issued from its own search results. Raw "
-        "URLs are refused — including links found inside a fetched page and URLs "
-        f"pasted by the user ('{(url or '').strip()[:80]}'). Run search first and "
-        "pass the ref:// token of the result you want."
+        "URLs are refused, including links found inside a fetched page and URLs "
+        "pasted by the user. Run search first and pass the ref:// token of the "
+        "result you want."
     )
 
 
 def _unknown_ref_error(token: str) -> str:
+    """Explain an unknown token without echoing it, for the same reason as above.
+
+    Reachable from expand_link as well as fetch_content, and the token argument
+    is entirely caller-controlled.
+    """
+    del token  # deliberately not echoed
     return (
-        f"Error: Unknown link reference '{(token or '').strip()}'. Only ref:// tokens "
-        "returned by this server's search results can be expanded, and they are "
-        "forgotten when the server restarts. Run the search again to get a fresh token."
+        "Error: unknown link reference. Only ref:// tokens returned by this "
+        "server's search results can be expanded, and they are forgotten when the "
+        "server restarts. Run the search again to get a fresh token."
     )
 
 
@@ -1850,6 +1864,10 @@ CACHE_MAX_BYTES = _env_int("DDG_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES, minim
 MAX_CONTENT_BYTES = _env_int("DDG_MAX_CONTENT_BYTES", DEFAULT_MAX_CONTENT_BYTES, minimum=0)
 URL_POLICY = _validated_url_policy(os.getenv("DDG_FETCH_URL_POLICY", "any"))
 MAX_URL_LENGTH = _env_int("DDG_MAX_URL_LENGTH", DEFAULT_MAX_URL_LENGTH, minimum=0)
+# Env-only, with no CLI counterpart on purpose: the tool descriptions are built
+# from this value and registered with the SDK at import, before main() parses
+# argv. A flag applied afterwards would leave the tools advertising a fence they
+# no longer apply — the exact mismatch the envelope exists to prevent.
 CONTENT_ENVELOPE = os.getenv("DDG_CONTENT_ENVELOPE", "on").strip().lower() not in (
     "0",
     "false",
@@ -2221,17 +2239,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--content-envelope",
-        choices=["on", "off"],
-        default=None,
-        help=(
-            "Wrap web content in tagged, id-fenced blocks so page text cannot "
-            "impersonate the server's own output (default: on, or "
-            "DDG_CONTENT_ENVELOPE). Turn off only for clients that post-process "
-            "tool output themselves."
-        ),
-    )
-    parser.add_argument(
         "--parse-mode",
         choices=list(SUPPORTED_PARSE_MODES),
         default=None,
@@ -2353,11 +2360,6 @@ def main():
     max_url_length = (
         args.max_url_length if args.max_url_length is not None else MAX_URL_LENGTH
     )
-    content_envelope = (
-        (args.content_envelope == "on")
-        if args.content_envelope is not None
-        else CONTENT_ENVELOPE
-    )
     parse_mode = args.parse_mode if args.parse_mode is not None else PARSE_MODE
     ref_url_threshold = (
         args.ref_url_threshold if args.ref_url_threshold is not None else REF_URL_THRESHOLD
@@ -2377,7 +2379,7 @@ def main():
         cache_max_entries=cache_max_entries,
         cache_max_bytes=cache_max_bytes,
         max_content_bytes=max_content_bytes,
-        content_envelope=content_envelope,
+        content_envelope=CONTENT_ENVELOPE,
         url_policy=url_policy,
         max_url_length=max_url_length,
         parse_mode=parse_mode,
@@ -2413,7 +2415,6 @@ def main():
         or args.rate_limit_strategy is not None
         or args.ref_url_threshold is not None
         or args.max_content_bytes is not None
-        or args.content_envelope is not None
         or args.fetch_url_policy is not None
     )
     if rebuild_searcher:
@@ -2426,7 +2427,7 @@ def main():
             rate_limit_strategy=rate_strategy,
             ref_url_threshold=ref_url_threshold,
             max_content_bytes=max_content_bytes,
-            content_envelope=content_envelope,
+            content_envelope=CONTENT_ENVELOPE,
             url_policy=url_policy,
         )
         print(f"  Search backend: {searcher.backend}", file=sys.stderr)

@@ -212,7 +212,7 @@ async def test_expand_link_tool_round_trips_ref_token():
         assert result.content[0].text == long_url
 
         missing = await client.call_tool("expand_link", {"token": "ref://00000000"})
-        assert missing.content[0].text.startswith("Error: Unknown link reference")
+        assert missing.content[0].text.startswith("Error: unknown link reference")
 
 
 @pytest.mark.asyncio
